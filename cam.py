@@ -16,37 +16,26 @@ from pytorch_grad_cam.utils.image import (
 )
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, ClassifierOutputReST
 
+current_path = os.path.dirname(os.path.abspath(__file__))
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cpu',
                         help='Torch device to use')
-    parser.add_argument(
-        '--image-path',
-        type=str,
-        default='./examples/both.png',
-        help='Input image path')
-    parser.add_argument('--aug-smooth', action='store_true',
-                        help='Apply test time augmentation to smooth the CAM')
-    parser.add_argument(
-        '--eigen-smooth',
-        action='store_true',
-        help='Reduce noise by taking the first principle component'
-        'of cam_weights*activations')
-    parser.add_argument('--method', type=str, default='gradcam',
-                        choices=[
+    parser.add_argument('--image-dir',type=str,default=os.path.join(current_path, 'images'), help='Input image directory')
+    parser.add_argument('--image-name',type=str,default='car.png', help='Input image name')
+    parser.add_argument('--aug-smooth', action='store_true', help='Apply test time augmentation to smooth the CAM')
+    parser.add_argument('--eigen-smooth', action='store_true',help='Reduce noise by taking the first principle component of cam_weights*activations')
+    parser.add_argument('--method', type=str, default='gradcam', choices=[
                             'gradcam', 'fem', 'hirescam', 'gradcam++',
                             'scorecam', 'xgradcam', 'ablationcam',
                             'eigencam', 'eigengradcam', 'layercam',
                             'fullgrad', 'gradcamelementwise', 'kpcacam', 'shapleycam',
-                            'finercam'
-                        ],
-                        help='CAM method')
+                            'finercam' ], help='CAM method')
 
-    parser.add_argument('--output-dir', type=str, default='output',
-                        help='Output directory to save the images')
+    parser.add_argument('--output-dir', type=str, default=os.path.join(current_path, 'output'),help='Output directory to save the images')
     args = parser.parse_args()
-    
+
     if args.device:
         print(f'Using device "{args.device}" for acceleration')
     else:
@@ -99,10 +88,15 @@ if __name__ == '__main__':
     # You can also try selecting all layers of a certain type, with e.g:
     # from pytorch_grad_cam.utils.find_layers import find_layer_types_recursive
     # find_layer_types_recursive(model, [torch.nn.ReLU])
-    
+
     target_layers = [model.layer4]
 
-    rgb_img = cv2.imread(args.image_path, 1)[:, :, ::-1]
+    # Get image path from args
+    image_path = os.path.join(args.image_dir, args.image_name)
+    # Extract image name without extension for output filename
+    image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    rgb_img = cv2.imread(image_path, 1)[:, :, ::-1]
     rgb_img = np.float32(rgb_img) / 255
     input_tensor = preprocess_image(rgb_img,
                                     mean=[0.485, 0.456, 0.406],
@@ -144,9 +138,9 @@ if __name__ == '__main__':
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    cam_output_path = os.path.join(args.output_dir, f'{args.method}_cam.jpg')
-    gb_output_path = os.path.join(args.output_dir, f'{args.method}_gb.jpg')
-    cam_gb_output_path = os.path.join(args.output_dir, f'{args.method}_cam_gb.jpg')
+    cam_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_cam.jpg')
+    gb_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_gb.jpg')
+    cam_gb_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_cam_gb.jpg')
 
     cv2.imwrite(cam_output_path, cam_image)
     cv2.imwrite(gb_output_path, gb)

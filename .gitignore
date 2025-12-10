@@ -1,4 +1,31 @@
-build
-dist
-*.egg-info
-**/*.pyc
+# build files
+
+
+*.pth
+__pycache__/
+*.txt
+*.csv
+*.json
+*.yaml
+*.yml
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
+*.jsonl.zip
+images_edpl
+
+output
+Output
+test_images
+
+# Mac
+.DS_Store
+
+#process data
+*.bin
+
+#ignore data
+data
+
+# Exceptions
+!.gitinore
