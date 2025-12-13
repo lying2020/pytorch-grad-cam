@@ -95,13 +95,13 @@ def get_args():
     parser.add_argument('--output-dir', type=str,
                         default=os.path.join(current_path, 'output'),
                         help='输出目录')
-    parser.add_argument('--json-file', type=str, default="images/image-01.json",
+    parser.add_argument('--json-file', type=str, default="images/image.json",
                         help='JSON元数据文件路径（如果指定，将批量处理JSON中的所有图片）')
     parser.add_argument('--patch-num', type=int, default=7,
                         help='将图像切分的网格大小（patch_num x patch_num），默认7（即7x7网格）')
     parser.add_argument('--min-patch-size', type=int, default=None,
                         help='组合patch的最小尺寸（默认值为patch_num-3）。例如patch_num=7时，最小size=4，会生成4x4, 4x5, 5x4, 5x5等组合')
-    parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.4, 0.2, 0.2, 0.2],
+    parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.3, 0.2, 0.1, 0.1],
                         help='合并热力图的目标保留比例（0-1之间）。可以是单个值（所有层级使用相同比例）或4个值（第一遍、第二遍、第三遍、第四遍分别使用）。默认[0.4, 0.2, 0.2, 0.15]')
     args = parser.parse_args()
 
@@ -337,6 +337,94 @@ def merge_heatmaps(heatmaps, positions, grid_size=(4, 4), original_shape=None):
         merged_heatmap[y1:y2, x1:x2] = resized_heatmap
 
     return merged_heatmap
+
+
+def calculate_heatmap_concentration(heatmap, description=""):
+    """
+    计算热力图的集中度指标，用于判断关注是否集中
+
+    参数:
+        heatmap: numpy array, 输入热力图
+        description: str, 描述信息（用于打印）
+    返回:
+        metrics: dict, 包含各种集中度指标
+            - entropy: 熵值（越高越分散，0-1之间归一化）
+            - peak_concentration: 峰值集中度（top 10%区域占总能量的比例，0-1之间）
+            - effective_area_ratio: 有效区域占比（超过均值的区域占比，0-1之间）
+            - sparsity: 稀疏度（非零区域占比，0-1之间）
+            - gini_coefficient: Gini系数（衡量不平等性，0-1之间，越高越集中）
+            - concentration_score: 综合集中度分数（0-1之间，越高越集中）
+    """
+    # 归一化热力图到0-1范围
+    heatmap_normalized = heatmap.copy()
+    if heatmap_normalized.max() > 0:
+        heatmap_normalized = (heatmap_normalized - heatmap_normalized.min()) / (heatmap_normalized.max() - heatmap_normalized.min() + 1e-10)
+
+    # 1. 计算熵（衡量分布的均匀性）
+    # 将热力图分成bins，计算概率分布
+    hist, _ = np.histogram(heatmap_normalized.flatten(), bins=50, range=(0, 1))
+    hist = hist + 1e-10  # 避免log(0)
+    prob = hist / hist.sum()
+    entropy = -np.sum(prob * np.log2(prob))
+    # 归一化熵到0-1（最大熵是log2(50)）
+    entropy_normalized = entropy / np.log2(50)
+
+    # 2. 峰值集中度：top 10%区域占总能量的比例
+    sorted_values = np.sort(heatmap_normalized.flatten())
+    top_10_percent_threshold = sorted_values[int(len(sorted_values) * 0.9)]
+    top_10_percent_mask = heatmap_normalized >= top_10_percent_threshold
+    total_energy = heatmap_normalized.sum()
+    top_10_percent_energy = heatmap_normalized[top_10_percent_mask].sum()
+    peak_concentration = top_10_percent_energy / (total_energy + 1e-10)
+
+    # 3. 有效区域占比：超过均值的区域占比
+    mean_value = heatmap_normalized.mean()
+    effective_area = np.sum(heatmap_normalized > mean_value)
+    total_area = heatmap_normalized.size
+    effective_area_ratio = effective_area / total_area
+
+    # 4. 稀疏度：非零区域占比
+    sparsity = np.sum(heatmap_normalized > 0) / total_area
+
+    # 5. Gini系数：衡量不平等性（越高越集中）
+    # 将值排序后计算Gini系数
+    sorted_vals = np.sort(heatmap_normalized.flatten())
+    n = len(sorted_vals)
+    cumsum = np.cumsum(sorted_vals)
+    gini_coefficient = (2 * np.sum((np.arange(1, n+1)) * sorted_vals)) / (n * cumsum[-1] + 1e-10) - (n + 1) / n
+
+    # 6. 综合集中度分数（结合多个指标）
+    # 熵越低、峰值集中度越高、Gini系数越高，则越集中
+    concentration_score = (1 - entropy_normalized) * 0.3 + peak_concentration * 0.4 + gini_coefficient * 0.3
+    concentration_score = np.clip(concentration_score, 0, 1)
+
+    metrics = {
+        'entropy': entropy_normalized,
+        'peak_concentration': peak_concentration,
+        'effective_area_ratio': effective_area_ratio,
+        'sparsity': sparsity,
+        'gini_coefficient': gini_coefficient,
+        'concentration_score': concentration_score
+    }
+
+    if description:
+        print(f"    {description}")
+        print(f"      熵值 (Entropy): {entropy_normalized:.4f} (越低越集中，<0.5较好)")
+        print(f"      峰值集中度 (Peak Concentration): {peak_concentration:.4f} (top 10%%区域能量占比，>0.5较好)")
+        print(f"      有效区域占比 (Effective Area): {effective_area_ratio:.4f} (超过均值的区域占比)")
+        print(f"      稀疏度 (Sparsity): {sparsity:.4f} (非零区域占比)")
+        print(f"      Gini系数: {gini_coefficient:.4f} (越高越集中，>0.5较好)")
+        print(f"      综合集中度分数: {concentration_score:.4f} (0-1，越高越集中，>0.6较好)")
+
+        # 给出判断
+        if concentration_score > 0.6:
+            print(f"      ✓ 判断: 热力图集中度良好，关注区域明确")
+        elif concentration_score > 0.4:
+            print(f"      ⚠ 判断: 热力图集中度中等，关注区域较为分散")
+        else:
+            print(f"      ✗ 判断: 热力图集中度较差，关注区域过于分散")
+
+    return metrics
 
 
 def apply_adaptive_threshold(heatmap, target_retention_ratio=0.25, description=""):
@@ -829,6 +917,12 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
         combined_mean_value = np.mean(combined_all_heatmap)
         print(f"  合并后热力图均值: {combined_mean_value:.4f}")
 
+        # 计算集中度指标（在阈值过滤之前）
+        concentration_metrics = calculate_heatmap_concentration(
+            combined_all_heatmap,
+            description="  集中度分析（所有类型合并后）"
+        )
+
         # 第三遍过滤：对合并后的综合热力图应用自适应阈值过滤
         combined_all_heatmap_thresholded, threshold_value, actual_ratio = apply_adaptive_threshold(
             combined_all_heatmap,
@@ -958,6 +1052,9 @@ if __name__ == '__main__':
 
             # 第一步：处理 text_description（整体语义）
             text_description = image_data.get('text_description', '')
+            text_heatmap = None
+            text_rgb_img = None
+
             if text_description:
                 print(f"\n{'='*60}")
                 print(f"步骤1: 处理整体语义描述 (text_description)")
@@ -974,14 +1071,17 @@ if __name__ == '__main__':
                 target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
 
                 try:
-                    # 处理单张图片，结果保存到 base_image_output_dir
-                    _, _, _ = process_single_image(image_path, text_description, model, cam_algorithm, target_layers, args, base_output_dir=base_image_output_dir)
+                    # 处理单张图片，结果保存到 base_image_output_dir，并获取热力图
+                    _, text_heatmap, text_rgb_img = process_single_image(
+                        image_path, text_description, model, cam_algorithm, target_layers, args, base_output_dir=base_image_output_dir
+                    )
 
                 except Exception as e:
                     print(f"错误: 处理图片 {image_data['filename']} 的 text_description 时出错: {e}")
                     import traceback
                     traceback.print_exc()
-                    continue
+                    text_heatmap = None
+                    text_rgb_img = None
 
             # 第二步：处理 semantic 数组中的每个子语义
             semantic_list = image_data.get('semantic', [])
@@ -989,9 +1089,25 @@ if __name__ == '__main__':
                 # 如果semantic是字符串，转换为列表
                 semantic_list = [semantic_list]
 
-            # 收集所有子语义的合并热力图
+            # 收集所有子语义的合并热力图（只收集集中度 > 0.6 的）
             all_semantic_heatmaps = []
             all_semantic_rgb_imgs = []
+            all_semantic_info = []  # 记录每个热力图的来源信息
+
+            # 收集 text_description 的热力图（如果集中度 > 0.6）
+            if text_description and text_heatmap is not None:
+                # 计算 text_description 热力图的集中度
+                text_concentration = calculate_heatmap_concentration(
+                    text_heatmap,
+                    description=f"  全图语义(text_description)集中度分析: {text_description[:50]}..."
+                )
+                if text_concentration['concentration_score'] > 0.6:
+                    all_semantic_heatmaps.append(text_heatmap)
+                    all_semantic_rgb_imgs.append(text_rgb_img)
+                    all_semantic_info.append(f"text_description: {text_description}")
+                    print(f"  ✓ 全图语义热力图已纳入合并（集中度分数: {text_concentration['concentration_score']:.4f} > 0.6）")
+                else:
+                    print(f"  ✗ 全图语义热力图未纳入合并（集中度分数: {text_concentration['concentration_score']:.4f} <= 0.6）")
 
             if semantic_list and len(semantic_list) > 0:
                 print(f"\n{'='*60}")
@@ -1024,10 +1140,22 @@ if __name__ == '__main__':
                             image_path, semantic_text, model, cam_algorithm, target_layers, args, base_output_dir=semantic_output_dir
                         )
 
-                        # 收集合并后的热力图（如果存在）
+                        # 收集合并后的热力图（只收集集中度 > 0.6 的）
                         if semantic_heatmap is not None:
-                            all_semantic_heatmaps.append(semantic_heatmap)
-                            all_semantic_rgb_imgs.append(semantic_rgb_img)
+                            # 计算该子语义热力图的集中度
+                            semantic_concentration = calculate_heatmap_concentration(
+                                semantic_heatmap,
+                                description=f"  子语义[{semantic_idx}]集中度分析: {semantic_text[:50]}..."
+                            )
+
+                            # 只收集集中度分数 > 0.6 的热力图
+                            if semantic_concentration['concentration_score'] > 0.6:
+                                all_semantic_heatmaps.append(semantic_heatmap)
+                                all_semantic_rgb_imgs.append(semantic_rgb_img)
+                                all_semantic_info.append(f"semantic_{semantic_idx}: {semantic_text}")
+                                print(f"  ✓ 子语义[{semantic_idx}]热力图已纳入合并（集中度分数: {semantic_concentration['concentration_score']:.4f} > 0.6）")
+                            else:
+                                print(f"  ✗ 子语义[{semantic_idx}]热力图未纳入合并（集中度分数: {semantic_concentration['concentration_score']:.4f} <= 0.6）")
 
                         # 在子语义文件夹中创建txt文件保存语义信息
                         semantic_txt_path = os.path.join(semantic_output_dir, 'semantic_info.txt')
@@ -1042,10 +1170,15 @@ if __name__ == '__main__':
                         traceback.print_exc()
                         continue
 
-            # 步骤3：合并所有子语义的结果
+            # 步骤3：合并所有子语义的结果（只合并集中度 > 0.6 的）
             if len(all_semantic_heatmaps) > 0:
                 print(f"\n{'='*60}")
                 print(f"步骤3: 合并所有子语义的热力图（像素级加权平均）")
+                print(f"纳入合并的热力图数量: {len(all_semantic_heatmaps)} (集中度分数 > 0.6)")
+                if all_semantic_info:
+                    print(f"纳入合并的语义信息:")
+                    for info in all_semantic_info:
+                        print(f"  - {info}")
                 print(f"{'='*60}")
 
                 # 获取第一个热力图的形状
@@ -1070,6 +1203,12 @@ if __name__ == '__main__':
                 # 计算统计信息
                 combined_semantic_mean_value = np.mean(combined_all_semantic_heatmap)
                 print(f"  合并后热力图均值: {combined_semantic_mean_value:.4f}")
+
+                # 计算集中度指标（在阈值过滤之前）
+                semantic_concentration_metrics = calculate_heatmap_concentration(
+                    combined_all_semantic_heatmap,
+                    description="  集中度分析（所有语义合并后）"
+                )
 
                 # 第四遍过滤：对合并后的所有语义热力图应用自适应阈值过滤
                 combined_all_semantic_heatmap_thresholded, threshold_value, actual_ratio = apply_adaptive_threshold(

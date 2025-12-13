@@ -17,7 +17,8 @@ images_edpl
 output
 Output
 test_images
-
+birds/
+outputs/
 # Mac
 .DS_Store
 
