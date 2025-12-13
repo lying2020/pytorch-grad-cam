@@ -95,25 +95,25 @@ def get_args():
     parser.add_argument('--output-dir', type=str,
                         default=os.path.join(current_path, 'output'),
                         help='输出目录')
-    parser.add_argument('--json-file', type=str, default="images/image.json",
+    parser.add_argument('--json-file', type=str, default="images/image-01.json",
                         help='JSON元数据文件路径（如果指定，将批量处理JSON中的所有图片）')
     parser.add_argument('--patch-num', type=int, default=7,
                         help='将图像切分的网格大小（patch_num x patch_num），默认7（即7x7网格）')
     parser.add_argument('--min-patch-size', type=int, default=None,
                         help='组合patch的最小尺寸（默认值为patch_num-3）。例如patch_num=7时，最小size=4，会生成4x4, 4x5, 5x4, 5x5等组合')
-    parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.4, 0.2, 0.2],
-                        help='合并热力图的目标保留比例（0-1之间）。可以是单个值（所有层级使用相同比例）或3个值（第一遍、第二遍、第三遍分别使用）。默认0.25表示保留25%%的区域')
+    parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.4, 0.2, 0.2, 0.2],
+                        help='合并热力图的目标保留比例（0-1之间）。可以是单个值（所有层级使用相同比例）或4个值（第一遍、第二遍、第三遍、第四遍分别使用）。默认[0.4, 0.2, 0.2, 0.15]')
     args = parser.parse_args()
 
-    # 处理target-retention-ratio参数：支持单个值或3个值的列表
+    # 处理target-retention-ratio参数：支持单个值或4个值的列表
     if len(args.target_retention_ratio) == 1:
         # 单个值，所有层级使用相同比例
-        args.target_retention_ratio = [args.target_retention_ratio[0]] * 3
-    elif len(args.target_retention_ratio) == 3:
-        # 3个值，分别用于第一遍、第二遍、第三遍过滤
+        args.target_retention_ratio = [args.target_retention_ratio[0]] * 4
+    elif len(args.target_retention_ratio) == 4:
+        # 4个值，分别用于第一遍、第二遍、第三遍、第四遍过滤
         args.target_retention_ratio = args.target_retention_ratio
     else:
-        raise ValueError(f"target-retention-ratio 必须是1个值或3个值，当前提供 {len(args.target_retention_ratio)} 个值")
+        raise ValueError(f"target-retention-ratio 必须是1个值或4个值，当前提供 {len(args.target_retention_ratio)} 个值")
 
     # 验证所有值都在合理范围内
     for i, ratio in enumerate(args.target_retention_ratio):
@@ -857,15 +857,27 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
         print(f"  ✓ 所有类型合并热力图: {os.path.basename(combined_all_heatmap_path)}")
         print(f"  ✓ 所有类型合并CAM叠加图: {os.path.basename(combined_all_cam_path)}")
 
-    # 保存原始图像
-    original_output_path = os.path.join(image_output_dir, f'original.jpg')
-    cv2.imwrite(original_output_path, cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        # 保存原始图像
+        original_output_path = os.path.join(image_output_dir, f'original.jpg')
+        cv2.imwrite(original_output_path, cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
-    print(f"\n{'='*60}")
-    print(f"完成！所有可视化结果已保存到: {image_output_dir}")
-    print(f"{'='*60}")
+        print(f"\n{'='*60}")
+        print(f"完成！所有可视化结果已保存到: {image_output_dir}")
+        print(f"{'='*60}")
 
-    return image_output_dir
+        # 返回合并后的热力图（在应用阈值之前），用于后续合并所有语义
+        return image_output_dir, combined_all_heatmap, rgb_img
+    else:
+        # 保存原始图像
+        original_output_path = os.path.join(image_output_dir, f'original.jpg')
+        cv2.imwrite(original_output_path, cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+        print(f"\n{'='*60}")
+        print(f"完成！所有可视化结果已保存到: {image_output_dir}")
+        print(f"{'='*60}")
+
+        # 如果没有生成合并热力图，返回None
+        return image_output_dir, None, rgb_img
 
 
 if __name__ == '__main__':
@@ -963,7 +975,7 @@ if __name__ == '__main__':
 
                 try:
                     # 处理单张图片，结果保存到 base_image_output_dir
-                    process_single_image(image_path, text_description, model, cam_algorithm, target_layers, args, base_output_dir=base_image_output_dir)
+                    _, _, _ = process_single_image(image_path, text_description, model, cam_algorithm, target_layers, args, base_output_dir=base_image_output_dir)
 
                 except Exception as e:
                     print(f"错误: 处理图片 {image_data['filename']} 的 text_description 时出错: {e}")
@@ -976,6 +988,10 @@ if __name__ == '__main__':
             if isinstance(semantic_list, str):
                 # 如果semantic是字符串，转换为列表
                 semantic_list = [semantic_list]
+
+            # 收集所有子语义的合并热力图
+            all_semantic_heatmaps = []
+            all_semantic_rgb_imgs = []
 
             if semantic_list and len(semantic_list) > 0:
                 print(f"\n{'='*60}")
@@ -1004,7 +1020,14 @@ if __name__ == '__main__':
 
                     try:
                         # 处理单张图片，结果保存到 semantic_output_dir
-                        process_single_image(image_path, semantic_text, model, cam_algorithm, target_layers, args, base_output_dir=semantic_output_dir)
+                        _, semantic_heatmap, semantic_rgb_img = process_single_image(
+                            image_path, semantic_text, model, cam_algorithm, target_layers, args, base_output_dir=semantic_output_dir
+                        )
+
+                        # 收集合并后的热力图（如果存在）
+                        if semantic_heatmap is not None:
+                            all_semantic_heatmaps.append(semantic_heatmap)
+                            all_semantic_rgb_imgs.append(semantic_rgb_img)
 
                         # 在子语义文件夹中创建txt文件保存语义信息
                         semantic_txt_path = os.path.join(semantic_output_dir, 'semantic_info.txt')
@@ -1019,9 +1042,70 @@ if __name__ == '__main__':
                         traceback.print_exc()
                         continue
 
-            # 处理完所有子语义后，创建 summaries 文件夹并拷贝相关文件
+            # 步骤3：合并所有子语义的结果
+            if len(all_semantic_heatmaps) > 0:
+                print(f"\n{'='*60}")
+                print(f"步骤3: 合并所有子语义的热力图（像素级加权平均）")
+                print(f"{'='*60}")
+
+                # 获取第一个热力图的形状
+                first_heatmap = all_semantic_heatmaps[0]
+                h, w = first_heatmap.shape
+                combined_all_semantic_heatmap = np.zeros((h, w), dtype=np.float32)
+
+                # 使用像素级加权平均合并所有子语义的热力图
+                heatmap_stack = np.stack(all_semantic_heatmaps, axis=0)  # shape: (num_semantics, h, w)
+                num_semantics = len(all_semantic_heatmaps)
+
+                # 对每个像素位置，在所有语义间进行softmax归一化
+                heatmap_flat = heatmap_stack.reshape(num_semantics, -1)  # (num_semantics, h*w)
+                heatmap_flat_exp = np.exp(heatmap_flat - np.max(heatmap_flat, axis=0, keepdims=True))
+                weight_flat_normalized = heatmap_flat_exp / (np.sum(heatmap_flat_exp, axis=0, keepdims=True) + 1e-10)
+                weight_stack_normalized = weight_flat_normalized.reshape(num_semantics, h, w)
+
+                # 使用归一化后的权重进行加权平均
+                for idx, heatmap in enumerate(all_semantic_heatmaps):
+                    combined_all_semantic_heatmap += heatmap * weight_stack_normalized[idx]
+
+                # 计算统计信息
+                combined_semantic_mean_value = np.mean(combined_all_semantic_heatmap)
+                print(f"  合并后热力图均值: {combined_semantic_mean_value:.4f}")
+
+                # 第四遍过滤：对合并后的所有语义热力图应用自适应阈值过滤
+                combined_all_semantic_heatmap_thresholded, threshold_value, actual_ratio = apply_adaptive_threshold(
+                    combined_all_semantic_heatmap,
+                    target_retention_ratio=args.target_retention_ratio[3] if len(args.target_retention_ratio) > 3 else args.target_retention_ratio[2],
+                    description="  第四遍过滤（所有语义合并后）"
+                )
+
+                # 使用第一个RGB图像进行可视化（所有语义应该使用同一张原图）
+                rgb_img_for_combined = all_semantic_rgb_imgs[0] if len(all_semantic_rgb_imgs) > 0 else None
+
+                if rgb_img_for_combined is not None:
+                    # 生成可视化
+                    combined_all_semantic_heatmap_uint8 = np.uint8(255 * combined_all_semantic_heatmap_thresholded)
+                    combined_all_semantic_heatmap_colored = cv2.applyColorMap(combined_all_semantic_heatmap_uint8, cv2.COLORMAP_JET)
+                    combined_all_semantic_cam_image = show_cam_on_image(rgb_img_for_combined, combined_all_semantic_heatmap_thresholded, use_rgb=True)
+                    combined_all_semantic_cam_image = cv2.cvtColor(combined_all_semantic_cam_image, cv2.COLOR_RGB2BGR)
+
+                    # 保存到主目录
+                    combined_all_semantic_heatmap_path = os.path.join(
+                        base_image_output_dir,
+                        f'merged_{args.method}_all_semantics_combined_heatmap.jpg'
+                    )
+                    combined_all_semantic_cam_path = os.path.join(
+                        base_image_output_dir,
+                        f'merged_{args.method}_all_semantics_combined_cam.jpg'
+                    )
+
+                    cv2.imwrite(combined_all_semantic_heatmap_path, combined_all_semantic_heatmap_colored)
+                    cv2.imwrite(combined_all_semantic_cam_path, combined_all_semantic_cam_image)
+                    print(f"  ✓ 所有语义合并热力图: {os.path.basename(combined_all_semantic_heatmap_path)}")
+                    print(f"  ✓ 所有语义合并CAM叠加图: {os.path.basename(combined_all_semantic_cam_path)}")
+
+            # 步骤4：创建 summaries 文件夹并拷贝相关文件
             print(f"\n{'='*60}")
-            print(f"步骤3: 创建 summaries 文件夹并整理结果")
+            print(f"步骤4: 创建 summaries 文件夹并整理结果")
             print(f"{'='*60}")
 
             summaries_dir = os.path.join(base_image_output_dir, 'summaries')
@@ -1108,6 +1192,18 @@ if __name__ == '__main__':
                         )
                         shutil.copy2(semantic_all_combined_cam, summaries_semantic_all_combined_cam)
                         print(f"  ✓ 拷贝 merged_{args.method}_all_combined_cam{suffix}.jpg 到 summaries/")
+
+            # 拷贝合并所有语义的结果
+            all_semantics_combined_heatmap = os.path.join(base_image_output_dir, f'merged_{args.method}_all_semantics_combined_heatmap.jpg')
+            all_semantics_combined_cam = os.path.join(base_image_output_dir, f'merged_{args.method}_all_semantics_combined_cam.jpg')
+            if os.path.exists(all_semantics_combined_heatmap):
+                summaries_all_semantics_heatmap = os.path.join(summaries_dir, f'merged_{args.method}_all_semantics_combined_heatmap.jpg')
+                shutil.copy2(all_semantics_combined_heatmap, summaries_all_semantics_heatmap)
+                print(f"  ✓ 拷贝 merged_{args.method}_all_semantics_combined_heatmap.jpg 到 summaries/")
+            if os.path.exists(all_semantics_combined_cam):
+                summaries_all_semantics_cam = os.path.join(summaries_dir, f'merged_{args.method}_all_semantics_combined_cam.jpg')
+                shutil.copy2(all_semantics_combined_cam, summaries_all_semantics_cam)
+                print(f"  ✓ 拷贝 merged_{args.method}_all_semantics_combined_cam.jpg 到 summaries/")
 
         print(f"\n{'='*60}")
         print(f"批量处理完成！共处理 {len(images_list)} 张图片")
