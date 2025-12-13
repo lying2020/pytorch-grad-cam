@@ -92,12 +92,27 @@ transform = transforms.Compose([
 # ==========================================
 # 3. 核心主函数
 # ==========================================
-def run_partgcd_visualization(image_paths, K=4, output_file="partgcd_result.png"):
+def run_partgcd_visualization(image_paths, K=4, output_file="partgcd_result.png", dataset_name=None):
     """
     完整复现 PartGCD Figure 6
     :param image_paths: 图片路径列表
     :param K: 部件数量 (CUB鸟类建议5, 汽车建议6, 其他建议4)
+    :param dataset_name: 数据集名称（如 "cars", "birds"），如果为None则从路径中自动提取
     """
+    # 如果没有提供数据集名称，尝试从路径中提取
+    if dataset_name is None and image_paths:
+        # 从第一个路径中提取数据集名称
+        first_path = image_paths[0]
+        # 尝试从路径中提取数据集名称（例如 "outputs/cars/xxx.jpg" -> "cars"）
+        path_parts = first_path.replace('\\', '/').split('/')
+        # 查找可能的数据集名称（在outputs、dataset等目录下的子目录）
+        for i, part in enumerate(path_parts):
+            if part in ['outputs', 'dataset', 'data'] and i + 1 < len(path_parts):
+                dataset_name = path_parts[i + 1]
+                break
+        # 如果还是没找到，使用默认值
+        if dataset_name is None:
+            dataset_name = "dataset"
     if not image_paths:
         print("错误：没有找到图片，请检查路径。")
         return
@@ -173,16 +188,37 @@ def run_partgcd_visualization(image_paths, K=4, output_file="partgcd_result.png"
     # -------------------------------------------------------
     print(f"\n--- 阶段 3: 生成可视化 ---")
 
-    # 随机选 3 张图展示（或全部展示）
-    display_count = min(3, len(batch_data))
-    fig, axes = plt.subplots(display_count, K + 1, figsize=(3 * (K+1), 3 * display_count))
+    # 随机选 4 张图展示（或全部展示）
+    display_count = min(4, len(batch_data))
 
-    # 添加总标题
-    fig.suptitle('PartGCD Visualization', fontsize=16, fontweight='bold', y=0.98)
+    # 定义统一的图片大小
+    TARGET_SIZE = (256, 256)
+
+    # 计算总图片数：每张原图有 1个原图 + K个part = K+1 个图
+    total_images = display_count * (K + 1)
+
+    # 4行布局，计算列数
+    num_rows = 4
+    num_cols = int(np.ceil(total_images / num_rows))
+
+    # 创建紧凑的布局
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(2.5 * num_cols, 2.5 * num_rows))
+
+    # 添加总标题（包含数据集名称）
+    title = f'PartGCD Visualization - {dataset_name.upper()}'
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
 
     # 确保 axes 是 2D 数组
-    if display_count == 1:
+    if num_rows == 1:
         axes = np.expand_dims(axes, axis=0)
+    if num_cols == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    # 扁平化axes以便索引
+    axes_flat = axes.flatten()
+
+    # 当前图片索引
+    img_idx = 0
 
     for i in range(display_count):
         item = batch_data[i]
@@ -199,14 +235,16 @@ def run_partgcd_visualization(image_paths, K=4, output_file="partgcd_result.png"
         h, w = 14, 14
         part_maps = probs.reshape(h, w, K)
 
-        # 1. 绘制原图
-        ax_orig = axes[i, 0]
-        ax_orig.imshow(original_img)
+        # 1. 绘制原图（统一resize到TARGET_SIZE）
+        original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
+        ax_orig = axes_flat[img_idx]
+        ax_orig.imshow(original_img_resized)
         ax_orig.axis('off')
+        img_idx += 1
 
         # 2. 绘制各个 Part
         for k in range(K):
-            ax_part = axes[i, k+1]
+            ax_part = axes_flat[img_idx]
 
             # 取出第 k 个 part 的热力图
             heatmap = part_maps[:, :, k]
@@ -220,17 +258,26 @@ def run_partgcd_visualization(image_paths, K=4, output_file="partgcd_result.png"
             heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
             heatmap_uint8 = np.uint8(255 * heatmap_norm)
 
-            # 步骤 3: 双立方插值上采样 (比 Linear 更平滑)
-            heatmap_resized = cv2.resize(heatmap_uint8, (original_img.size[0], original_img.size[1]), interpolation=cv2.INTER_CUBIC)
+            # 步骤 3: 双立方插值上采样到统一大小
+            heatmap_resized = cv2.resize(heatmap_uint8, TARGET_SIZE, interpolation=cv2.INTER_CUBIC)
+
+            # 原图也resize到统一大小
+            original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
 
             # 绘制 (使用 matplotlib 的 alpha 混合，效果最干净)
-            ax_part.imshow(original_img)
+            ax_part.imshow(original_img_resized)
             # jet 颜色映射，alpha=0.6 实现半透明叠加
             im = ax_part.imshow(heatmap_resized, cmap='jet', alpha=0.6)
 
             ax_part.axis('off')
+            img_idx += 1
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # 为总标题留出空间
+    # 隐藏多余的子图
+    for idx in range(img_idx, len(axes_flat)):
+        axes_flat[idx].axis('off')
+
+    # 紧凑布局，减少间距（行间距为原来的1/5）
+    plt.subplots_adjust(hspace=0.02, wspace=0.1, top=0.96)  # 设置紧凑间距，为总标题留出空间
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"可视化结果已保存至: {output_file}")
@@ -243,7 +290,7 @@ if __name__ == "__main__":
     # 配置: 修改这里的路径匹配模式
     # -------------------------------------------------
     # 例如: "dataset/birds/*.jpg" 或者简单的 "*.jpg"
-    img_path_pattern = "cars/*.jpg"
+    img_path_pattern = "outputs/cars/*.jpg"
 
     # 搜索图片
     img_list = glob.glob(img_path_pattern)
@@ -251,9 +298,23 @@ if __name__ == "__main__":
     if len(img_list) > 0:
         print(f"找到 {len(img_list)} 张图片: {img_list[:3]} ...")
 
+        # 从路径中提取数据集名称
+        dataset_name = None
+        if 'cars' in img_path_pattern.lower():
+            dataset_name = "cars"
+        elif 'birds' in img_path_pattern.lower() or 'cub' in img_path_pattern.lower():
+            dataset_name = "birds"
+        elif 'dataset' in img_path_pattern:
+            # 尝试从路径中提取
+            path_parts = img_path_pattern.replace('\\', '/').split('/')
+            for i, part in enumerate(path_parts):
+                if part in ['outputs', 'dataset', 'data'] and i + 1 < len(path_parts):
+                    dataset_name = path_parts[i + 1]
+                    break
+
         # CUB鸟类建议 K=5
         # Stanford Cars 建议 K=6
         # 其他通用物体 建议 K=4
-        run_partgcd_visualization(img_list, K=5, output_file="outputs/partgcd_reproduction.png")
+        run_partgcd_visualization(img_list, K=5, output_file="outputs/partgcd_reproduction.png", dataset_name=dataset_name)
     else:
         print(f"当前目录下未找到匹配 '{img_path_pattern}' 的图片，请修改代码底部的 img_path_pattern 变量。")
