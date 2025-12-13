@@ -23,7 +23,8 @@ def get_args():
     parser.add_argument('--device', type=str, default='cpu',
                         help='Torch device to use')
     parser.add_argument('--image-dir',type=str,default=os.path.join(current_path, 'images'), help='Input image directory')
-    parser.add_argument('--image-name',type=str,default='car.png', help='Input image name')
+    parser.add_argument('--image-name',type=str,default='dog_pug_39.jpg', help='Input image name')
+    parser.add_argument('--image-text',type=str,default='dog_pug_39', help='Input image text')
     parser.add_argument('--aug-smooth', action='store_true', help='Apply test time augmentation to smooth the CAM')
     parser.add_argument('--eigen-smooth', action='store_true',help='Reduce noise by taking the first principle component of cam_weights*activations')
     parser.add_argument('--method', type=str, default='gradcam', choices=[
@@ -126,6 +127,14 @@ if __name__ == '__main__':
 
         grayscale_cam = grayscale_cam[0, :]
 
+        # Save intermediate results before fusion
+        # Save the heatmap (grayscale CAM) as a visualization
+        heatmap_uint8 = np.uint8(255 * grayscale_cam)
+        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+        # Save the original image (convert RGB to BGR for saving)
+        original_img_bgr = cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
         cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
         cam_image = cv2.cvtColor(cam_image, cv2.COLOR_RGB2BGR)
 
@@ -138,10 +147,20 @@ if __name__ == '__main__':
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Save intermediate results (before fusion)
+    heatmap_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_heatmap.jpg')
+    original_output_path = os.path.join(args.output_dir, f'{image_name}_original.jpg')
+
+    # Save final results (after fusion)
     cam_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_cam.jpg')
     gb_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_gb.jpg')
     cam_gb_output_path = os.path.join(args.output_dir, f'{image_name}_{args.method}_cam_gb.jpg')
 
+    # Save intermediate results
+    cv2.imwrite(heatmap_output_path, heatmap_colored)
+    cv2.imwrite(original_output_path, original_img_bgr)
+
+    # Save final results
     cv2.imwrite(cam_output_path, cam_image)
     cv2.imwrite(gb_output_path, gb)
     cv2.imwrite(cam_gb_output_path, cam_gb)
