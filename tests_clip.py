@@ -17,6 +17,8 @@ CLIP模型可视化测试脚本
 import argparse
 import os
 import json
+import glob
+import shutil
 import cv2
 import numpy as np
 import torch
@@ -66,13 +68,13 @@ def get_args():
                         default=os.path.join(current_path, 'images'),
                         help='输入图像目录')
     parser.add_argument('--image-name', type=str,
-                        default='car.png',
+                        default='bird_flycatcher.jpg',
                         help='输入图像文件名')
     parser.add_argument('--image-text', type=str,
-                        default='The tyres of a car',
+                        default='A sharp bird\'s beak',
                         help='输入图像文本描述（用于输出文件名）')
     parser.add_argument('--labels', type=str, nargs='+',
-                        default=["a bird", "a cat", "a dog", "a car"],
+                        default=["bird", "animal"],
                         help='需要识别的文本标签列表')
     parser.add_argument('--clip-model-path', type=str,
                         default='/home/liying/Documents/clip-vit-large-patch14',
@@ -93,15 +95,30 @@ def get_args():
     parser.add_argument('--output-dir', type=str,
                         default=os.path.join(current_path, 'output'),
                         help='输出目录')
-    parser.add_argument('--json-file', type=str, default=None,
+    parser.add_argument('--json-file', type=str, default="images/image.json",
                         help='JSON元数据文件路径（如果指定，将批量处理JSON中的所有图片）')
     parser.add_argument('--patch-num', type=int, default=7,
                         help='将图像切分的网格大小（patch_num x patch_num），默认7（即7x7网格）')
     parser.add_argument('--min-patch-size', type=int, default=None,
                         help='组合patch的最小尺寸（默认值为patch_num-3）。例如patch_num=7时，最小size=4，会生成4x4, 4x5, 5x4, 5x5等组合')
-    parser.add_argument('--target-retention-ratio', type=float, default=0.25,
-                        help='合并热力图的目标保留比例（0-1之间），默认0.25表示保留25%%的区域。阈值会根据此比例自适应计算')
+    parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.4, 0.2, 0.2],
+                        help='合并热力图的目标保留比例（0-1之间）。可以是单个值（所有层级使用相同比例）或3个值（第一遍、第二遍、第三遍分别使用）。默认0.25表示保留25%%的区域')
     args = parser.parse_args()
+
+    # 处理target-retention-ratio参数：支持单个值或3个值的列表
+    if len(args.target_retention_ratio) == 1:
+        # 单个值，所有层级使用相同比例
+        args.target_retention_ratio = [args.target_retention_ratio[0]] * 3
+    elif len(args.target_retention_ratio) == 3:
+        # 3个值，分别用于第一遍、第二遍、第三遍过滤
+        args.target_retention_ratio = args.target_retention_ratio
+    else:
+        raise ValueError(f"target-retention-ratio 必须是1个值或3个值，当前提供 {len(args.target_retention_ratio)} 个值")
+
+    # 验证所有值都在合理范围内
+    for i, ratio in enumerate(args.target_retention_ratio):
+        if not (0.05 <= ratio <= 0.95):
+            raise ValueError(f"target-retention-ratio[{i}] 必须在0.05-0.95之间，当前值: {ratio}")
 
     # 计算最小patch size（如果未指定，使用默认值patch_num-3）
     if args.min_patch_size is None:
@@ -336,7 +353,7 @@ def apply_adaptive_threshold(heatmap, target_retention_ratio=0.25, description="
         actual_ratio: float, 实际保留比例
     """
     # 确保目标比例在合理范围内
-    target_ratio = max(0.05, min(0.5, target_retention_ratio))
+    target_ratio = max(0.05, min(0.95, target_retention_ratio))
 
     # 将热力图的所有值排序
     sorted_values = np.sort(heatmap.flatten())
@@ -585,10 +602,10 @@ def process_combined_patches(model, cam_algorithm, target_layers, patches, posit
             combined_h, combined_w = combined_patch.shape[:2]
             grayscale_cam_resized = cv2.resize(grayscale_cam, (combined_w, combined_h))
 
-            # 第一遍过滤：对每个子图应用自适应阈值过滤
+            # 第一遍过滤：对每个子图应用自适应阈值过滤（使用第一遍的比例）
             grayscale_cam_filtered, _, _ = apply_adaptive_threshold(
                 grayscale_cam_resized,
-                target_retention_ratio=args.target_retention_ratio,
+                target_retention_ratio=args.target_retention_ratio[0],
                 description=""
             )
 
@@ -642,14 +659,14 @@ def merge_heatmaps_by_type(all_heatmaps, positions, combined_heatmaps_data, grid
                 original_shape=original_shape
             )
 
-            # 第一遍过滤：对合成后的每个类型热力图应用自适应阈值过滤
+            # 第二遍过滤：对合成后的每个类型热力图应用自适应阈值过滤
             # 判断是否为较大的组合（高度或宽度 >= 4）
             h, w = map(int, patch_type.split('x'))
             if h >= 4 or w >= 4:
                 merged_type_heatmap, _, _ = apply_adaptive_threshold(
                     merged_type_heatmap,
-                    target_retention_ratio=args.target_retention_ratio,
-                    description=f"    第一遍过滤 ({patch_type}类型)"
+                    target_retention_ratio=args.target_retention_ratio[1],
+                    description=f"    第二遍过滤 ({patch_type}类型)"
                 )
 
             # 保存热力图数据用于后续合并
@@ -661,13 +678,16 @@ def merge_heatmaps_by_type(all_heatmaps, positions, combined_heatmaps_data, grid
             merged_type_cam_image = show_cam_on_image(rgb_img, merged_type_heatmap, use_rgb=True)
             merged_type_cam_image = cv2.cvtColor(merged_type_cam_image, cv2.COLOR_RGB2BGR)
 
-            # 保存
+            # 保存到 merged_gradcam 子文件夹（除了 all_combined 之外的所有 merged 文件）
+            merged_gradcam_dir = os.path.join(image_output_dir, 'merged_gradcam')
+            os.makedirs(merged_gradcam_dir, exist_ok=True)
+
             merged_type_heatmap_path = os.path.join(
-                image_output_dir,
+                merged_gradcam_dir,
                 f'merged_{args.method}_{patch_type}_heatmap.jpg'
             )
             merged_type_cam_path = os.path.join(
-                image_output_dir,
+                merged_gradcam_dir,
                 f'merged_{args.method}_{patch_type}_cam.jpg'
             )
 
@@ -676,11 +696,22 @@ def merge_heatmaps_by_type(all_heatmaps, positions, combined_heatmaps_data, grid
             print(f"    ✓ {patch_type} 热力图: {os.path.basename(merged_type_heatmap_path)}")
             print(f"    ✓ {patch_type} CAM叠加图: {os.path.basename(merged_type_cam_path)}")
 
-    return all_merged_heatmaps
+    return all_merged_heatmaps, image_output_dir
 
 
-def process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args):
-    """处理单张图片的完整流程"""
+def process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args, base_output_dir=None):
+    """
+    处理单张图片的完整流程
+
+    参数:
+        image_path: 图片路径
+        image_text: 语义描述文本
+        model: CLIP模型
+        cam_algorithm: CAM算法类
+        target_layers: 目标层
+        args: 参数对象
+        base_output_dir: 基础输出目录（如果为None，则使用args.output_dir/{image_name}）
+    """
     # 加载和预处理图像
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"图像文件不存在: {image_path}")
@@ -698,7 +729,10 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
     # 创建输出目录结构
     os.makedirs(args.output_dir, exist_ok=True)
     image_name = os.path.splitext(os.path.basename(image_path))[0]
-    image_output_dir = os.path.join(args.output_dir, image_name)
+    if base_output_dir is None:
+        image_output_dir = os.path.join(args.output_dir, image_name)
+    else:
+        image_output_dir = base_output_dir
     os.makedirs(image_output_dir, exist_ok=True)
 
     # 创建CAM对象
@@ -753,7 +787,7 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
         cv2.imwrite(os.path.join(combined_output_dir, f"{info['name']}_heatmap.jpg"), heatmap_colored)
 
     # 第四步：按类型合成大图
-    all_merged_heatmaps = merge_heatmaps_by_type(
+    all_merged_heatmaps, _ = merge_heatmaps_by_type(
         None, positions, combined_heatmaps_data, grid_size, original_shape,
         full_heatmap_mean_value, rgb_img, image_output_dir, args
     )
@@ -795,11 +829,11 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
         combined_mean_value = np.mean(combined_all_heatmap)
         print(f"  合并后热力图均值: {combined_mean_value:.4f}")
 
-        # 第二遍过滤：对合并后的综合热力图应用自适应阈值过滤
+        # 第三遍过滤：对合并后的综合热力图应用自适应阈值过滤
         combined_all_heatmap_thresholded, threshold_value, actual_ratio = apply_adaptive_threshold(
             combined_all_heatmap,
-            target_retention_ratio=args.target_retention_ratio,
-            description="  第二遍过滤（所有类型合并后）"
+            target_retention_ratio=args.target_retention_ratio[2],
+            description="  第三遍过滤（所有类型合并后）"
         )
 
         # 生成可视化
@@ -830,6 +864,8 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
     print(f"\n{'='*60}")
     print(f"完成！所有可视化结果已保存到: {image_output_dir}")
     print(f"{'='*60}")
+
+    return image_output_dir
 
 
 if __name__ == '__main__':
@@ -893,34 +929,185 @@ if __name__ == '__main__':
 
         print(f"找到 {len(images_list)} 张图片，开始批量处理...")
 
-        # 为每张图片处理（每张图片使用自己的语义描述）
+        # 为每张图片处理
         for idx, image_data in enumerate(images_list, 1):
             image_path = image_data.get('path') or os.path.join(
                 metadata.get('images_dir', args.image_dir),
                 image_data['filename']
             )
-            image_text = image_data.get('semantic', image_data.get('filename', ''))
+
+            # 获取图片名称（不含扩展名）
+            image_name = os.path.splitext(image_data['filename'])[0]
+            base_image_output_dir = os.path.join(args.output_dir, image_name)
 
             print(f"\n{'='*60}")
-            print(f"处理进度: [{idx}/{len(images_list)}]")
+            print(f"处理进度: [{idx}/{len(images_list)}] - {image_data['filename']}")
             print(f"{'='*60}")
 
-            # 为每张图片创建模型（使用对应的语义描述）
-            model = CLIPImageClassifier(
-                text_description=image_text,
-                model_path=args.clip_model_path,
-                labels=args.labels
-            ).to(torch.device(args.device))
-            model.eval()
+            # 第一步：处理 text_description（整体语义）
+            text_description = image_data.get('text_description', '')
+            if text_description:
+                print(f"\n{'='*60}")
+                print(f"步骤1: 处理整体语义描述 (text_description)")
+                print(f"语义: {text_description}")
+                print(f"{'='*60}")
 
-            target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
+                # 创建模型（使用text_description）
+                model = CLIPImageClassifier(
+                    text_description=text_description,
+                    model_path=args.clip_model_path,
+                    labels=args.labels
+                ).to(torch.device(args.device))
+                model.eval()
+                target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
 
-            # 处理单张图片
-            try:
-                process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args)
-            except Exception as e:
-                print(f"错误: 处理图片 {image_data['filename']} 时出错: {e}")
-                continue
+                try:
+                    # 处理单张图片，结果保存到 base_image_output_dir
+                    process_single_image(image_path, text_description, model, cam_algorithm, target_layers, args, base_output_dir=base_image_output_dir)
+
+                except Exception as e:
+                    print(f"错误: 处理图片 {image_data['filename']} 的 text_description 时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            # 第二步：处理 semantic 数组中的每个子语义
+            semantic_list = image_data.get('semantic', [])
+            if isinstance(semantic_list, str):
+                # 如果semantic是字符串，转换为列表
+                semantic_list = [semantic_list]
+
+            if semantic_list and len(semantic_list) > 0:
+                print(f"\n{'='*60}")
+                print(f"步骤2: 处理子语义描述 (semantic数组，共{len(semantic_list)}个)")
+                print(f"{'='*60}")
+
+                for semantic_idx, semantic_text in enumerate(semantic_list):
+                    if not semantic_text or not semantic_text.strip():
+                        continue
+
+                    print(f"\n{'='*60}")
+                    print(f"处理子语义 [{semantic_idx+1}/{len(semantic_list)}]: {semantic_text}")
+                    print(f"{'='*60}")
+
+                    # 创建子语义输出目录
+                    semantic_output_dir = os.path.join(base_image_output_dir, f'semantic_{semantic_idx}')
+
+                    # 创建模型（使用当前子语义）
+                    model = CLIPImageClassifier(
+                        text_description=semantic_text,
+                        model_path=args.clip_model_path,
+                        labels=args.labels
+                    ).to(torch.device(args.device))
+                    model.eval()
+                    target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
+
+                    try:
+                        # 处理单张图片，结果保存到 semantic_output_dir
+                        process_single_image(image_path, semantic_text, model, cam_algorithm, target_layers, args, base_output_dir=semantic_output_dir)
+
+                        # 在子语义文件夹中创建txt文件保存语义信息
+                        semantic_txt_path = os.path.join(semantic_output_dir, 'semantic_info.txt')
+                        with open(semantic_txt_path, 'w', encoding='utf-8') as f:
+                            f.write(f"Semantic Index: {semantic_idx}\n")
+                            f.write(f"Semantic Text: {semantic_text}\n")
+                        print(f"  ✓ 语义信息已保存到: semantic_info.txt")
+
+                    except Exception as e:
+                        print(f"错误: 处理图片 {image_data['filename']} 的子语义 {semantic_idx} ({semantic_text}) 时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+
+            # 处理完所有子语义后，创建 summaries 文件夹并拷贝相关文件
+            print(f"\n{'='*60}")
+            print(f"步骤3: 创建 summaries 文件夹并整理结果")
+            print(f"{'='*60}")
+
+            summaries_dir = os.path.join(base_image_output_dir, 'summaries')
+            os.makedirs(summaries_dir, exist_ok=True)
+
+            # 拷贝 text_description 生成的结果和原图
+            if text_description:
+                # 拷贝原图
+                original_path = os.path.join(base_image_output_dir, 'original.jpg')
+                if os.path.exists(original_path):
+                    summaries_original_path = os.path.join(summaries_dir, 'original.jpg')
+                    shutil.copy2(original_path, summaries_original_path)
+                    print(f"  ✓ 拷贝原图到 summaries/")
+
+                # 拷贝 full_gradcam 文件
+                full_heatmap_path = os.path.join(base_image_output_dir, f'full_{args.method}_heatmap.jpg')
+                full_cam_path = os.path.join(base_image_output_dir, f'full_{args.method}_cam.jpg')
+                if os.path.exists(full_heatmap_path):
+                    summaries_full_heatmap = os.path.join(summaries_dir, f'full_{args.method}_heatmap.jpg')
+                    shutil.copy2(full_heatmap_path, summaries_full_heatmap)
+                    print(f"  ✓ 拷贝 full_{args.method}_heatmap.jpg 到 summaries/")
+                if os.path.exists(full_cam_path):
+                    summaries_full_cam = os.path.join(summaries_dir, f'full_{args.method}_cam.jpg')
+                    shutil.copy2(full_cam_path, summaries_full_cam)
+                    print(f"  ✓ 拷贝 full_{args.method}_cam.jpg 到 summaries/")
+
+                # 拷贝 merged_gradcam_all_combined 文件
+                all_combined_heatmap = os.path.join(base_image_output_dir, f'merged_{args.method}_all_combined_heatmap.jpg')
+                all_combined_cam = os.path.join(base_image_output_dir, f'merged_{args.method}_all_combined_cam.jpg')
+                if os.path.exists(all_combined_heatmap):
+                    summaries_all_combined_heatmap = os.path.join(summaries_dir, f'merged_{args.method}_all_combined_heatmap.jpg')
+                    shutil.copy2(all_combined_heatmap, summaries_all_combined_heatmap)
+                    print(f"  ✓ 拷贝 merged_{args.method}_all_combined_heatmap.jpg 到 summaries/")
+                if os.path.exists(all_combined_cam):
+                    summaries_all_combined_cam = os.path.join(summaries_dir, f'merged_{args.method}_all_combined_cam.jpg')
+                    shutil.copy2(all_combined_cam, summaries_all_combined_cam)
+                    print(f"  ✓ 拷贝 merged_{args.method}_all_combined_cam.jpg 到 summaries/")
+
+            # 拷贝每个子语义的 full_gradcam 和 merged_gradcam_all_combined 文件（加上语义文件夹名字的后缀）
+            if semantic_list and len(semantic_list) > 0:
+                for semantic_idx, semantic_text in enumerate(semantic_list):
+                    if not semantic_text or not semantic_text.strip():
+                        continue
+
+                    semantic_output_dir = os.path.join(base_image_output_dir, f'semantic_{semantic_idx}')
+                    suffix = f'_semantic_{semantic_idx}'
+
+                    # 拷贝 full_gradcam 文件
+                    semantic_full_heatmap = os.path.join(semantic_output_dir, f'full_{args.method}_heatmap.jpg')
+                    semantic_full_cam = os.path.join(semantic_output_dir, f'full_{args.method}_cam.jpg')
+
+                    if os.path.exists(semantic_full_heatmap):
+                        summaries_semantic_full_heatmap = os.path.join(
+                            summaries_dir,
+                            f'full_{args.method}_heatmap{suffix}.jpg'
+                        )
+                        shutil.copy2(semantic_full_heatmap, summaries_semantic_full_heatmap)
+                        print(f"  ✓ 拷贝 full_{args.method}_heatmap{suffix}.jpg 到 summaries/")
+
+                    if os.path.exists(semantic_full_cam):
+                        summaries_semantic_full_cam = os.path.join(
+                            summaries_dir,
+                            f'full_{args.method}_cam{suffix}.jpg'
+                        )
+                        shutil.copy2(semantic_full_cam, summaries_semantic_full_cam)
+                        print(f"  ✓ 拷贝 full_{args.method}_cam{suffix}.jpg 到 summaries/")
+
+                    # 拷贝 merged_gradcam_all_combined 文件
+                    semantic_all_combined_heatmap = os.path.join(semantic_output_dir, f'merged_{args.method}_all_combined_heatmap.jpg')
+                    semantic_all_combined_cam = os.path.join(semantic_output_dir, f'merged_{args.method}_all_combined_cam.jpg')
+
+                    if os.path.exists(semantic_all_combined_heatmap):
+                        summaries_semantic_all_combined_heatmap = os.path.join(
+                            summaries_dir,
+                            f'merged_{args.method}_all_combined_heatmap{suffix}.jpg'
+                        )
+                        shutil.copy2(semantic_all_combined_heatmap, summaries_semantic_all_combined_heatmap)
+                        print(f"  ✓ 拷贝 merged_{args.method}_all_combined_heatmap{suffix}.jpg 到 summaries/")
+
+                    if os.path.exists(semantic_all_combined_cam):
+                        summaries_semantic_all_combined_cam = os.path.join(
+                            summaries_dir,
+                            f'merged_{args.method}_all_combined_cam{suffix}.jpg'
+                        )
+                        shutil.copy2(semantic_all_combined_cam, summaries_semantic_all_combined_cam)
+                        print(f"  ✓ 拷贝 merged_{args.method}_all_combined_cam{suffix}.jpg 到 summaries/")
 
         print(f"\n{'='*60}")
         print(f"批量处理完成！共处理 {len(images_list)} 张图片")
