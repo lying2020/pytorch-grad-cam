@@ -3,13 +3,20 @@ CLIP模型可视化测试脚本
 支持使用本地CLIP模型路径进行图像-文本匹配可视化
 
 功能：
-1. 将图像切分成4x4网格（16个小图）
-2. 对每个小图，使用指定的文本描述生成热力图
-3. 将所有小图的热力图拼接成完整的大热力图
-4. 保存所有结果到output目录
+1. 将图像切分成可自定义的网格（默认7x7，可通过--patch-num参数调整）
+2. 生成完整图片的热力图
+3. 生成所有可能的组合patch热力图（从最小size到最大size）
+4. 按类型合成大图并保存
+5. 支持从JSON文件批量处理多张图片
+
+组合patch生成规则：
+- 默认网格大小：7x7
+- 默认最小组合尺寸：4x4（patch_num - 3）
+- 会生成从最小size到最大size的所有可能组合（例如：4x4, 4x5, 5x4, 5x5, 5x6, 6x5, 6x6等）
 """
 import argparse
 import os
+import json
 import cv2
 import numpy as np
 import torch
@@ -59,10 +66,10 @@ def get_args():
                         default=os.path.join(current_path, 'images'),
                         help='输入图像目录')
     parser.add_argument('--image-name', type=str,
-                        default='bird_flycatcher.jpg',
+                        default='car.png',
                         help='输入图像文件名')
     parser.add_argument('--image-text', type=str,
-                        default='The bird beak for a bird',
+                        default='The tyres of a car',
                         help='输入图像文本描述（用于输出文件名）')
     parser.add_argument('--labels', type=str, nargs='+',
                         default=["a bird", "a cat", "a dog", "a car"],
@@ -86,7 +93,23 @@ def get_args():
     parser.add_argument('--output-dir', type=str,
                         default=os.path.join(current_path, 'output'),
                         help='输出目录')
+    parser.add_argument('--json-file', type=str, default=None,
+                        help='JSON元数据文件路径（如果指定，将批量处理JSON中的所有图片）')
+    parser.add_argument('--patch-num', type=int, default=7,
+                        help='将图像切分的网格大小（patch_num x patch_num），默认7（即7x7网格）')
+    parser.add_argument('--min-patch-size', type=int, default=None,
+                        help='组合patch的最小尺寸（默认值为patch_num-3）。例如patch_num=7时，最小size=4，会生成4x4, 4x5, 5x4, 5x5等组合')
+    parser.add_argument('--target-retention-ratio', type=float, default=0.25,
+                        help='合并热力图的目标保留比例（0-1之间），默认0.25表示保留25%%的区域。阈值会根据此比例自适应计算')
     args = parser.parse_args()
+
+    # 计算最小patch size（如果未指定，使用默认值patch_num-3）
+    if args.min_patch_size is None:
+        args.min_patch_size = args.patch_num - 3
+    if args.min_patch_size < 1:
+        args.min_patch_size = 1
+    if args.min_patch_size > args.patch_num:
+        args.min_patch_size = args.patch_num
 
     # 自动检测设备（如果用户未指定）
     if args.device is None:
@@ -191,6 +214,68 @@ def split_image_into_grid(image, grid_size=(4, 4)):
     return patches, positions
 
 
+def generate_combined_patches(patches, positions, grid_size=(7, 7), min_patch_size=4):
+    """
+    生成所有可能的组合patch，从最小size到最大size的所有组合
+
+    参数:
+        patches: list of numpy arrays, 原始的小图列表
+        positions: list of tuples, 每个小图的位置 (row, col)
+        grid_size: tuple, (rows, cols)
+        min_patch_size: int, 组合patch的最小尺寸（例如4表示最小4x4）
+    返回:
+        combined_patches: list of numpy arrays, 组合后的patch
+        combined_info: list of dict, 每个组合的信息 {'type': '4x4'/'4x5'/..., 'positions': [(r1,c1), ...], 'name': '...'}
+    """
+    rows, cols = grid_size
+    combined_patches = []
+    combined_info = []
+
+    # 创建一个位置到索引的映射
+    pos_to_idx = {pos: idx for idx, pos in enumerate(positions)}
+
+    # 生成从最小size到最大size的所有可能组合
+    max_size = min(rows, cols)
+    for h in range(min_patch_size, max_size + 1):  # 高度从min_patch_size到max_size
+        for w in range(min_patch_size, max_size + 1):  # 宽度从min_patch_size到max_size
+            # 遍历所有可能的起始位置
+            for start_i in range(rows - h + 1):
+                for start_j in range(cols - w + 1):
+                    # 收集这个区域的所有位置
+                    pos_list = []
+                    for i in range(start_i, start_i + h):
+                        for j in range(start_j, start_j + w):
+                            pos_list.append((i, j))
+
+                    # 检查所有位置是否都存在
+                    if all(pos in pos_to_idx for pos in pos_list):
+                        # 获取所有patch
+                        patch_list = [patches[pos_to_idx[pos]] for pos in pos_list]
+
+                        # 按行拼接：先水平拼接每一行，再垂直拼接所有行
+                        rows_patches = []
+                        for row_idx in range(h):
+                            row_start = row_idx * w
+                            row_end = row_start + w
+                            row_patches = patch_list[row_start:row_end]
+                            row_combined = np.hstack(row_patches)
+                            rows_patches.append(row_combined)
+
+                        # 垂直拼接所有行
+                        combined = np.vstack(rows_patches)
+                        combined_patches.append(combined)
+
+                        # 生成类型名称（例如 '4x4', '4x5', '5x4' 等）
+                        type_name = f'{h}x{w}'
+                        combined_info.append({
+                            'type': type_name,
+                            'positions': pos_list,
+                            'name': f'{type_name}_{start_i}_{start_j}'
+                        })
+
+    return combined_patches, combined_info
+
+
 def merge_heatmaps(heatmaps, positions, grid_size=(4, 4), original_shape=None):
     """
     将多个热力图拼接成一个大热力图
@@ -237,84 +322,137 @@ def merge_heatmaps(heatmaps, positions, grid_size=(4, 4), original_shape=None):
     return merged_heatmap
 
 
-if __name__ == '__main__':
+def apply_adaptive_threshold(heatmap, target_retention_ratio=0.25, description=""):
     """
-    使用示例:
-    python tests_clip.py --image-name bird_flycatcher.jpg --labels "a bird" "a cat" "a dog"
-    python tests_clip.py --clip-model-path /path/to/clip --method gradcam --aug-smooth
+    应用自适应阈值过滤（基于目标保留比例）
+
+    参数:
+        heatmap: numpy array, 输入热力图
+        target_retention_ratio: float, 目标保留比例（0-1之间）
+        description: str, 描述信息（用于打印）
+    返回:
+        thresholded_heatmap: numpy array, 阈值处理后的热力图
+        threshold_value: float, 使用的阈值
+        actual_ratio: float, 实际保留比例
     """
-    args = get_args()
+    # 确保目标比例在合理范围内
+    target_ratio = max(0.05, min(0.5, target_retention_ratio))
 
-    # 定义所有可用的CAM方法
-    methods = {
-        "gradcam": GradCAM,
-        "hirescam": HiResCAM,
-        "scorecam": ScoreCAM,
-        "gradcam++": GradCAMPlusPlus,
-        "ablationcam": AblationCAM,
-        "xgradcam": XGradCAM,
-        "eigencam": EigenCAM,
-        "eigengradcam": EigenGradCAM,
-        "layercam": LayerCAM,
-        "fullgrad": FullGrad,
-        "fem": FEM,
-        "gradcamelementwise": GradCAMElementWise,
-        'kpcacam': KPCA_CAM,
-        'shapleycam': ShapleyCAM,
-        'finercam': FinerCAM
-    }
+    # 将热力图的所有值排序
+    sorted_values = np.sort(heatmap.flatten())
+    # 计算对应的阈值位置（保留top target_ratio的比例）
+    threshold_idx = int(len(sorted_values) * (1 - target_ratio))
+    threshold_value = sorted_values[threshold_idx]
 
-    if args.method not in methods:
-        raise ValueError(f"不支持的方法: {args.method}。可选: {list(methods.keys())}")
+    # 应用阈值
+    thresholded_heatmap = np.where(
+        heatmap >= threshold_value,
+        heatmap,
+        0.0
+    )
 
-    # 检查模型路径是否存在
-    if not os.path.exists(args.clip_model_path):
-        raise FileNotFoundError(
-            f"CLIP模型路径不存在: {args.clip_model_path}\n"
-            f"请检查路径是否正确，或使用 --clip-model-path 指定正确的路径"
-        )
+    # 计算实际保留比例
+    actual_ratio = np.sum(thresholded_heatmap > 0) / thresholded_heatmap.size
 
-    # 加载CLIP模型
-    print(f"\n正在加载CLIP模型...")
-    print(f"使用文本描述: {args.image_text}")
-    model = CLIPImageClassifier(
-        text_description=args.image_text,
-        model_path=args.clip_model_path,
-        labels=args.labels
-    ).to(torch.device(args.device))
-    # 注意：不要设置为eval()模式，因为我们需要计算梯度
-    # 但为了确保模型行为一致，我们可以在需要时临时设置为train模式
-    model.eval()  # 先设置为eval
-    # 但我们需要确保在计算梯度时，相关层能够保留梯度
+    if description:
+        mean_value = np.mean(heatmap)
+        print(f"    {description}")
+        print(f"      目标保留比例: {target_ratio*100:.1f}%")
+        print(f"      自适应阈值: {threshold_value:.4f} (相对均值: {threshold_value/mean_value:.2f}x)")
+        print(f"      实际保留区域占比: {actual_ratio*100:.2f}%")
 
-    # 选择目标层 - CLIP ViT的最后一层layer norm
-    target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
-    print(f"目标层: {target_layers[0]}")
+    return thresholded_heatmap, threshold_value, actual_ratio
 
-    # 加载和预处理图像
-    image_path = os.path.join(args.image_dir, args.image_name)
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"图像文件不存在: {image_path}")
 
-    print(f"正在加载图像: {image_path}")
-    rgb_img = cv2.imread(image_path, 1)[:, :, ::-1]  # BGR to RGB
-    original_shape = rgb_img.shape[:2]  # 保存原始尺寸
-    rgb_img_original = rgb_img.copy()  # 保存原始图像用于完整图片处理
-    rgb_img = np.float32(rgb_img) / 255
+def merge_combined_heatmaps(heatmap_data_list, patch_type, grid_size=(7, 7), original_shape=None):
+    """
+    将组合patch的热力图合成大图
+    支持任意大小的组合类型（例如4x4, 4x5, 5x4, 5x5等）
+    对于重叠区域，使用加权平均策略：
+    - 先计算每个子图的平均heatmap值作为权重
+    - 平均heatmap值高的子图在重叠区域有更大的权重
+    - 这样重要性更高的子图会对重叠区域有更大的影响
 
-    # 创建输出目录结构
-    os.makedirs(args.output_dir, exist_ok=True)
-    image_name = os.path.splitext(os.path.basename(image_path))[0]
+    参数:
+        heatmap_data_list: list of dict, 每个dict包含'heatmap'和'positions'
+        patch_type: str, 组合类型，例如'4x4', '4x5', '5x4'等
+        grid_size: tuple, (rows, cols) 网格大小
+        original_shape: tuple, 原始图像尺寸 (H, W)
+    返回:
+        merged: numpy array, 合成后的大热力图
+    """
+    rows, cols = grid_size
+    if original_shape is None:
+        total_h, total_w = original_shape
+    else:
+        total_h, total_w = original_shape
 
-    # 创建以图片名命名的输出目录
-    image_output_dir = os.path.join(args.output_dir, image_name)
-    os.makedirs(image_output_dir, exist_ok=True)
+    # 解析patch_type，获取高度和宽度
+    h_size, w_size = map(int, patch_type.split('x'))
 
-    # 创建CAM对象
-    cam_algorithm = methods[args.method]
+    # 使用加权累加来处理重叠区域
+    merged_weighted_sum = np.zeros((total_h, total_w), dtype=np.float32)
+    merged_weight_sum = np.zeros((total_h, total_w), dtype=np.float32)
 
-    # 创建CAM对象
-    if args.method == "ablationcam":
+    patch_h = total_h // rows
+    patch_w = total_w // cols
+
+    # 第一步：计算每个子图的平均heatmap值作为权重
+    patch_weights = []
+    for data in heatmap_data_list:
+        heatmap = data['heatmap']
+        # 计算该子图的平均heatmap值作为权重
+        mean_value = np.mean(heatmap)
+        patch_weights.append(mean_value)
+
+    # 如果所有权重都为0，则使用均匀权重
+    if sum(patch_weights) == 0:
+        patch_weights = [1.0] * len(patch_weights)
+    else:
+        # 归一化权重，使权重总和等于patch数量（保持与平均值方法类似的尺度）
+        total_weight = sum(patch_weights)
+        patch_weights = [w / total_weight * len(patch_weights) for w in patch_weights]
+
+    # 第二步：使用权重进行加权累加
+    for data, weight in zip(heatmap_data_list, patch_weights):
+        heatmap = data['heatmap']
+        positions = data['positions']
+
+        # 获取起始位置（第一个patch的位置）
+        row, col = positions[0]
+
+        # 计算这个组合patch在原图中的位置
+        y1 = row * patch_h
+        y2 = min(y1 + patch_h * h_size, total_h)
+        x1 = col * patch_w
+        x2 = min(x1 + patch_w * w_size, total_w)
+
+        # 将热力图resize到对应区域的大小
+        resized = cv2.resize(heatmap, (x2 - x1, y2 - y1))
+
+        # 加权累加：heatmap值乘以权重
+        merged_weighted_sum[y1:y2, x1:x2] += resized * weight
+        merged_weight_sum[y1:y2, x1:x2] += weight
+
+    # 计算加权平均：对于重叠区域，使用加权平均
+    merged = np.where(merged_weight_sum > 0, merged_weighted_sum / merged_weight_sum, 0)
+    return merged
+
+
+def load_json_metadata(json_path):
+    """加载JSON元数据文件"""
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"JSON文件不存在: {json_path}")
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
+
+    return metadata
+
+
+def create_cam_object(model, target_layers, method, cam_algorithm, reshape_transform):
+    """创建CAM对象"""
+    if method == "ablationcam":
         cam = cam_algorithm(
             model=model,
             target_layers=target_layers,
@@ -327,8 +465,11 @@ if __name__ == '__main__':
             target_layers=target_layers,
             reshape_transform=reshape_transform
         )
+    return cam
 
-    # ========== 第一步：为完整图片生成热力图 ==========
+
+def process_full_image(model, cam, rgb_img_original, original_shape, args):
+    """处理完整图片，生成热力图"""
     print(f"\n{'='*60}")
     print(f"第一步：为完整图片生成{args.method.upper()}热力图")
     print(f"{'='*60}")
@@ -364,202 +505,442 @@ if __name__ == '__main__':
             (original_shape[1], original_shape[0])
         )
 
-        # 生成完整图片的热力图可视化
-        full_heatmap_uint8 = np.uint8(255 * full_grayscale_cam_resized)
+        # 阈值处理：计算均值，小于均值的部分清零，只保留关键位置
+        full_heatmap_mean_value = np.mean(full_grayscale_cam_resized)
+        print(f"  完整图片heatmap均值: {full_heatmap_mean_value:.4f}")
+        full_grayscale_cam_thresholded = np.where(
+            full_grayscale_cam_resized >= full_heatmap_mean_value,
+            full_grayscale_cam_resized,
+            0.0
+        )
+        print(f"  阈值处理后，保留区域占比: {np.sum(full_grayscale_cam_thresholded > 0) / full_grayscale_cam_thresholded.size * 100:.2f}%")
+
+        # 生成完整图片的热力图可视化（使用阈值处理后的heatmap）
+        full_heatmap_uint8 = np.uint8(255 * full_grayscale_cam_thresholded)
         full_heatmap_colored = cv2.applyColorMap(full_heatmap_uint8, cv2.COLORMAP_JET)
 
-        # 生成完整图片的CAM叠加图（使用原始尺寸的图像）
+        # 生成完整图片的CAM叠加图（使用阈值处理后的heatmap）
         rgb_img_for_cam = np.float32(rgb_img_original) / 255
-        full_cam_image = show_cam_on_image(rgb_img_for_cam, full_grayscale_cam_resized, use_rgb=True)
+        full_cam_image = show_cam_on_image(rgb_img_for_cam, full_grayscale_cam_thresholded, use_rgb=True)
         full_cam_image = cv2.cvtColor(full_cam_image, cv2.COLOR_RGB2BGR)
 
-        # 保存完整图片的结果到图片名目录下
-        full_heatmap_path = os.path.join(
-            image_output_dir,
-            f'full_{args.method}_heatmap.jpg'
-        )
-        full_cam_path = os.path.join(
-            image_output_dir,
-            f'full_{args.method}_cam.jpg'
-        )
-        full_original_path = os.path.join(
-            image_output_dir,
-            f'full_original.jpg'
-        )
+    return full_grayscale_cam_thresholded, full_heatmap_colored, full_cam_image, full_heatmap_mean_value
 
-        cv2.imwrite(full_heatmap_path, full_heatmap_colored)
-        cv2.imwrite(full_cam_path, full_cam_image)
-        cv2.imwrite(
-            full_original_path,
-            cv2.cvtColor((rgb_img_for_cam * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        )
 
-        print(f"  ✓ 完整图片热力图: {full_heatmap_path}")
-        print(f"  ✓ 完整图片CAM叠加图: {full_cam_path}")
-        print(f"  ✓ 完整图片原始图像: {full_original_path}")
 
-    # ========== 第二步：将图像切分成4x4网格并处理 ==========
+
+def process_combined_patches(model, cam_algorithm, target_layers, patches, positions, grid_size, min_patch_size, args):
+    """处理组合patches（从最小size到最大size的所有组合）"""
     print(f"\n{'='*60}")
-    print(f"第二步：将图像切分成4x4网格并生成热力图")
+    print(f"第三步：生成组合patch（最小尺寸{min_patch_size}x{min_patch_size}）并生成热力图")
     print(f"{'='*60}")
 
-    # 将图像切分成4x4网格
-    grid_size = (4, 4)
-    print(f"\n正在将图像切分成 {grid_size[0]}x{grid_size[1]} 网格...")
-    patches, positions = split_image_into_grid(rgb_img, grid_size)
-    print(f"已切分成 {len(patches)} 个小图")
+    # 生成所有组合patch
+    print(f"\n正在生成组合patch...")
+    combined_patches, combined_info = generate_combined_patches(patches, positions, grid_size, min_patch_size)
+    print(f"已生成 {len(combined_patches)} 个组合patch:")
+    type_counts = {}
+    for info in combined_info:
+        type_counts[info['type']] = type_counts.get(info['type'], 0) + 1
+    # 按类型排序输出
+    for patch_type in sorted(type_counts.keys(), key=lambda x: (int(x.split('x')[0]), int(x.split('x')[1]))):
+        count = type_counts[patch_type]
+        print(f"  - {patch_type}: {count} 个")
 
-    # 为每个小图生成热力图
-    print(f"\n正在为每个小图生成{args.method.upper()}热力图...")
-    all_heatmaps = []
-    all_patch_heatmaps_colored = []
-    all_patch_cam_images = []
+    # 为组合patch创建CAM对象
+    cam_combined = create_cam_object(model, target_layers, args.method, cam_algorithm, reshape_transform)
 
-    # 小图结果也保存在图片名目录下的patches子目录
-    patch_output_dir = os.path.join(image_output_dir, 'patches')
-    os.makedirs(patch_output_dir, exist_ok=True)
+    print(f"\n正在为每个组合patch生成{args.method.upper()}热力图...")
+    combined_heatmaps_data = []
 
-    # 为小图重新创建CAM对象，确保状态正确
-    if args.method == "ablationcam":
-        cam_patches = cam_algorithm(
-            model=model,
-            target_layers=target_layers,
-            reshape_transform=reshape_transform,
-            ablation_layer=AblationLayerVit()
-        )
-    else:
-        cam_patches = cam_algorithm(
-            model=model,
-            target_layers=target_layers,
-            reshape_transform=reshape_transform
-        )
+    with cam_combined:
+        cam_combined.batch_size = 32
 
-    with cam_patches:
-        cam_patches.batch_size = 32
+        for idx, (combined_patch, info) in enumerate(zip(combined_patches, combined_info)):
+            print(f"  处理组合patch {info['name']} ({info['type']}) [{idx+1}/{len(combined_patches)}]...")
 
-        for idx, (patch, (row, col)) in enumerate(zip(patches, positions)):
-            print(f"  处理小图 ({row}, {col}) [{idx+1}/{len(patches)}]...")
-
-            # 将小图resize到224x224（CLIP输入尺寸）
-            patch_resized = cv2.resize(patch, (224, 224))
+            # 将组合patch resize到224x224（CLIP输入尺寸）
+            combined_patch_resized = cv2.resize(combined_patch, (224, 224))
 
             # 预处理，并设置requires_grad=True以确保梯度计算
-            patch_tensor = preprocess_image(
-                patch_resized,
+            combined_tensor = preprocess_image(
+                combined_patch_resized,
                 mean=[0.5, 0.5, 0.5],
                 std=[0.5, 0.5, 0.5]
             ).to(args.device)
-            patch_tensor.requires_grad_(True)
+            combined_tensor.requires_grad_(True)
 
-            # 生成CAM - 使用RawScoresOutputTarget来直接使用logits
-            # CLIP模型的输出是logits_per_image，表示图像与文本的相似度
-            # 我们想要最大化这个相似度，所以直接使用原始输出
+            # 生成CAM
             targets = [RawScoresOutputTarget()]
 
-            grayscale_cam = cam_patches(
-                input_tensor=patch_tensor,
+            grayscale_cam = cam_combined(
+                input_tensor=combined_tensor,
                 targets=targets,
                 aug_smooth=args.aug_smooth,
                 eigen_smooth=args.eigen_smooth
             )
             grayscale_cam = grayscale_cam[0, :]
 
-            # 将热力图resize回小图原始尺寸
-            patch_h, patch_w = patch.shape[:2]
-            grayscale_cam_resized = cv2.resize(grayscale_cam, (patch_w, patch_h))
-            all_heatmaps.append(grayscale_cam_resized)
+            # 将热力图resize回组合patch原始尺寸
+            combined_h, combined_w = combined_patch.shape[:2]
+            grayscale_cam_resized = cv2.resize(grayscale_cam, (combined_w, combined_h))
 
-            # 生成小图的热力图可视化
-            heatmap_uint8 = np.uint8(255 * grayscale_cam_resized)
-            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-            all_patch_heatmaps_colored.append(heatmap_colored)
-
-            # 生成小图的CAM叠加图
-            patch_cam_image = show_cam_on_image(patch, grayscale_cam_resized, use_rgb=True)
-            patch_cam_image = cv2.cvtColor(patch_cam_image, cv2.COLOR_RGB2BGR)
-            all_patch_cam_images.append(patch_cam_image)
-
-            # 保存每个小图的结果
-            patch_heatmap_path = os.path.join(
-                patch_output_dir,
-                f'patch_{row}_{col}_heatmap.jpg'
-            )
-            patch_cam_path = os.path.join(
-                patch_output_dir,
-                f'patch_{row}_{col}_cam.jpg'
-            )
-            patch_original_path = os.path.join(
-                patch_output_dir,
-                f'patch_{row}_{col}_original.jpg'
+            # 第一遍过滤：对每个子图应用自适应阈值过滤
+            grayscale_cam_filtered, _, _ = apply_adaptive_threshold(
+                grayscale_cam_resized,
+                target_retention_ratio=args.target_retention_ratio,
+                description=""
             )
 
-            cv2.imwrite(patch_heatmap_path, heatmap_colored)
-            cv2.imwrite(patch_cam_path, patch_cam_image)
-            cv2.imwrite(
-                patch_original_path,
-                cv2.cvtColor((patch * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+            # 保存热力图数据用于后续合成（使用过滤后的热力图）
+            combined_heatmaps_data.append({
+                'heatmap': grayscale_cam_filtered,
+                'info': info
+            })
+
+    return combined_heatmaps_data, type_counts
+
+
+def merge_heatmaps_by_type(all_heatmaps, positions, combined_heatmaps_data, grid_size, original_shape,
+                           full_heatmap_mean_value, rgb_img, image_output_dir, args):
+    """
+    按类型合成大图
+    返回所有类型的热力图数据，用于后续合并
+    """
+    print(f"\n{'='*60}")
+    print(f"第四步：按组合类型合成大图")
+    print(f"{'='*60}")
+
+    # 保存组合patch的热力图数据，按类型分类
+    combined_heatmaps_by_type = {}
+
+    # 组合类型的热力图
+    for data in combined_heatmaps_data:
+        patch_type = data['info']['type']
+        if patch_type not in combined_heatmaps_by_type:
+            combined_heatmaps_by_type[patch_type] = []
+        combined_heatmaps_by_type[patch_type].append({
+            'heatmap': data['heatmap'],
+            'positions': data['info']['positions'],
+            'name': data['info']['name']
+        })
+
+    # 保存所有类型的热力图数据，用于后续合并
+    all_merged_heatmaps = {}
+
+    # 为每种类型生成合成大图（按类型排序）
+    print(f"\n正在按类型合成大图...")
+    sorted_types = sorted(combined_heatmaps_by_type.keys(),
+                         key=lambda x: (int(x.split('x')[0]), int(x.split('x')[1])))
+    for patch_type in sorted_types:
+        if len(combined_heatmaps_by_type[patch_type]) > 0:
+            print(f"  合成 {patch_type} 类型的大图...")
+            merged_type_heatmap = merge_combined_heatmaps(
+                combined_heatmaps_by_type[patch_type],
+                patch_type,
+                grid_size=grid_size,
+                original_shape=original_shape
             )
 
-    # 拼接所有热力图
-    print(f"\n正在拼接 {grid_size[0]}x{grid_size[1]} 个热力图...")
-    merged_heatmap = merge_heatmaps(
-        all_heatmaps,
-        positions,
-        grid_size=grid_size,
-        original_shape=original_shape
+            # 第一遍过滤：对合成后的每个类型热力图应用自适应阈值过滤
+            # 判断是否为较大的组合（高度或宽度 >= 4）
+            h, w = map(int, patch_type.split('x'))
+            if h >= 4 or w >= 4:
+                merged_type_heatmap, _, _ = apply_adaptive_threshold(
+                    merged_type_heatmap,
+                    target_retention_ratio=args.target_retention_ratio,
+                    description=f"    第一遍过滤 ({patch_type}类型)"
+                )
+
+            # 保存热力图数据用于后续合并
+            all_merged_heatmaps[patch_type] = merged_type_heatmap.copy()
+
+            # 生成可视化
+            merged_type_heatmap_uint8 = np.uint8(255 * merged_type_heatmap)
+            merged_type_heatmap_colored = cv2.applyColorMap(merged_type_heatmap_uint8, cv2.COLORMAP_JET)
+            merged_type_cam_image = show_cam_on_image(rgb_img, merged_type_heatmap, use_rgb=True)
+            merged_type_cam_image = cv2.cvtColor(merged_type_cam_image, cv2.COLOR_RGB2BGR)
+
+            # 保存
+            merged_type_heatmap_path = os.path.join(
+                image_output_dir,
+                f'merged_{args.method}_{patch_type}_heatmap.jpg'
+            )
+            merged_type_cam_path = os.path.join(
+                image_output_dir,
+                f'merged_{args.method}_{patch_type}_cam.jpg'
+            )
+
+            cv2.imwrite(merged_type_heatmap_path, merged_type_heatmap_colored)
+            cv2.imwrite(merged_type_cam_path, merged_type_cam_image)
+            print(f"    ✓ {patch_type} 热力图: {os.path.basename(merged_type_heatmap_path)}")
+            print(f"    ✓ {patch_type} CAM叠加图: {os.path.basename(merged_type_cam_path)}")
+
+    return all_merged_heatmaps
+
+
+def process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args):
+    """处理单张图片的完整流程"""
+    # 加载和预处理图像
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"图像文件不存在: {image_path}")
+
+    print(f"\n{'#'*60}")
+    print(f"处理图片: {os.path.basename(image_path)}")
+    print(f"语义描述: {image_text}")
+    print(f"{'#'*60}")
+
+    rgb_img = cv2.imread(image_path, 1)[:, :, ::-1]  # BGR to RGB
+    original_shape = rgb_img.shape[:2]
+    rgb_img_original = rgb_img.copy()
+    rgb_img = np.float32(rgb_img) / 255
+
+    # 创建输出目录结构
+    os.makedirs(args.output_dir, exist_ok=True)
+    image_name = os.path.splitext(os.path.basename(image_path))[0]
+    image_output_dir = os.path.join(args.output_dir, image_name)
+    os.makedirs(image_output_dir, exist_ok=True)
+
+    # 创建CAM对象
+    cam = create_cam_object(model, target_layers, args.method, cam_algorithm, reshape_transform)
+
+    # 第一步：处理完整图片
+    full_grayscale_cam_thresholded, full_heatmap_colored, full_cam_image, full_heatmap_mean_value = \
+        process_full_image(model, cam, rgb_img_original, original_shape, args)
+
+    # 保存完整图片结果（保持原有命名）
+    full_heatmap_path = os.path.join(image_output_dir, f'full_{args.method}_heatmap.jpg')
+    full_cam_path = os.path.join(image_output_dir, f'full_{args.method}_cam.jpg')
+    cv2.imwrite(full_heatmap_path, full_heatmap_colored)
+    cv2.imwrite(full_cam_path, full_cam_image)
+    print(f"  ✓ 完整图片热力图: {full_heatmap_path}")
+    print(f"  ✓ 完整图片CAM叠加图: {full_cam_path}")
+
+    # 同时保存为merged格式（与组合patch命名保持一致，使用实际的grid_size）
+    grid_size_str = f"{args.patch_num}x{args.patch_num}"
+    merged_full_heatmap_path = os.path.join(image_output_dir, f'merged_{args.method}_{grid_size_str}_heatmap.jpg')
+    merged_full_cam_path = os.path.join(image_output_dir, f'merged_{args.method}_{grid_size_str}_cam.jpg')
+    cv2.imwrite(merged_full_heatmap_path, full_heatmap_colored)
+    cv2.imwrite(merged_full_cam_path, full_cam_image)
+    print(f"  ✓ {grid_size_str}完整图片热力图: {merged_full_heatmap_path}")
+    print(f"  ✓ {grid_size_str}完整图片CAM叠加图: {merged_full_cam_path}")
+
+    # 第二步：切分图像为网格（用于生成组合patches）
+    grid_size = (args.patch_num, args.patch_num)
+    min_patch_size = args.min_patch_size
+    print(f"\n{'='*60}")
+    print(f"第二步：将图像切分成{args.patch_num}x{args.patch_num}网格（用于生成组合patches）")
+    print(f"最小组合尺寸: {min_patch_size}x{min_patch_size}")
+    print(f"{'='*60}")
+    patches, positions = split_image_into_grid(rgb_img, grid_size)
+    print(f"已切分成 {len(patches)} 个小图，用于生成组合patches")
+
+    # 第三步：处理组合patches
+    combined_output_dir = os.path.join(image_output_dir, 'combined_patches')
+    os.makedirs(combined_output_dir, exist_ok=True)
+    combined_heatmaps_data, type_counts = process_combined_patches(
+        model, cam_algorithm, target_layers, patches, positions, grid_size, min_patch_size, args
     )
 
-    # 生成拼接后的可视化
-    merged_heatmap_uint8 = np.uint8(255 * merged_heatmap)
-    merged_heatmap_colored = cv2.applyColorMap(merged_heatmap_uint8, cv2.COLORMAP_JET)
+    # 保存组合patches结果
+    for data in combined_heatmaps_data:
+        info = data['info']
+        heatmap = data['heatmap']
+        # 找到对应的combined_patch（需要从patches重建）
+        # 这里简化处理，只保存heatmap和cam
+        heatmap_uint8 = np.uint8(255 * heatmap)
+        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        cv2.imwrite(os.path.join(combined_output_dir, f"{info['name']}_heatmap.jpg"), heatmap_colored)
 
-    # 生成拼接后的CAM叠加图
-    merged_cam_image = show_cam_on_image(rgb_img, merged_heatmap, use_rgb=True)
-    merged_cam_image = cv2.cvtColor(merged_cam_image, cv2.COLOR_RGB2BGR)
+    # 第四步：按类型合成大图
+    all_merged_heatmaps = merge_heatmaps_by_type(
+        None, positions, combined_heatmaps_data, grid_size, original_shape,
+        full_heatmap_mean_value, rgb_img, image_output_dir, args
+    )
 
-    # 保存拼接后的结果到图片名目录下
-    merged_heatmap_path = os.path.join(
-        image_output_dir,
-        f'merged_{args.method}_heatmap.jpg'
-    )
-    merged_cam_path = os.path.join(
-        image_output_dir,
-        f'merged_{args.method}_cam.jpg'
-    )
-    original_output_path = os.path.join(
-        image_output_dir,
-        f'original.jpg'
-    )
+    # 第五步：合并所有类型的热力图（使用像素级加权平均，类似自注意力机制）
+    if len(all_merged_heatmaps) > 0:
+        print(f"\n{'='*60}")
+        print(f"第五步：合并所有组合类型的热力图（像素级加权平均，类似自注意力机制）")
+        print(f"{'='*60}")
+
+        # 获取第一个热力图的形状
+        first_heatmap = list(all_merged_heatmaps.values())[0]
+        h, w = first_heatmap.shape
+        combined_all_heatmap = np.zeros((h, w), dtype=np.float32)
+
+        # 对每个像素位置进行加权平均（类似自注意力机制）
+        # 使用向量化操作提高效率
+        # 将所有热力图堆叠成一个3D数组 (num_types, h, w)
+        heatmap_list = list(all_merged_heatmaps.values())
+        heatmap_stack = np.stack(heatmap_list, axis=0)  # shape: (num_types, h, w)
+        num_types = len(heatmap_list)
+
+        # 直接使用像素值作为权重的基础（类似自注意力机制）
+        # 对每个像素位置，在所有类型间进行softmax归一化
+        # 将heatmap_stack reshape为 (num_types, h*w)，然后对第一个维度进行softmax
+        heatmap_flat = heatmap_stack.reshape(num_types, -1)  # (num_types, h*w)
+
+        # Softmax归一化：exp(x) / sum(exp(x))
+        # 减去最大值避免数值溢出
+        heatmap_flat_exp = np.exp(heatmap_flat - np.max(heatmap_flat, axis=0, keepdims=True))
+        weight_flat_normalized = heatmap_flat_exp / (np.sum(heatmap_flat_exp, axis=0, keepdims=True) + 1e-10)
+        weight_stack_normalized = weight_flat_normalized.reshape(num_types, h, w)
+
+        # 使用归一化后的权重进行加权平均
+        for idx, heatmap in enumerate(heatmap_list):
+            combined_all_heatmap += heatmap * weight_stack_normalized[idx]
+
+        # 计算统计信息
+        combined_mean_value = np.mean(combined_all_heatmap)
+        print(f"  合并后热力图均值: {combined_mean_value:.4f}")
+
+        # 第二遍过滤：对合并后的综合热力图应用自适应阈值过滤
+        combined_all_heatmap_thresholded, threshold_value, actual_ratio = apply_adaptive_threshold(
+            combined_all_heatmap,
+            target_retention_ratio=args.target_retention_ratio,
+            description="  第二遍过滤（所有类型合并后）"
+        )
+
+        # 生成可视化
+        combined_all_heatmap_uint8 = np.uint8(255 * combined_all_heatmap_thresholded)
+        combined_all_heatmap_colored = cv2.applyColorMap(combined_all_heatmap_uint8, cv2.COLORMAP_JET)
+        combined_all_cam_image = show_cam_on_image(rgb_img, combined_all_heatmap_thresholded, use_rgb=True)
+        combined_all_cam_image = cv2.cvtColor(combined_all_cam_image, cv2.COLOR_RGB2BGR)
+
+        # 保存
+        combined_all_heatmap_path = os.path.join(
+            image_output_dir,
+            f'merged_{args.method}_all_combined_heatmap.jpg'
+        )
+        combined_all_cam_path = os.path.join(
+            image_output_dir,
+            f'merged_{args.method}_all_combined_cam.jpg'
+        )
+
+        cv2.imwrite(combined_all_heatmap_path, combined_all_heatmap_colored)
+        cv2.imwrite(combined_all_cam_path, combined_all_cam_image)
+        print(f"  ✓ 所有类型合并热力图: {os.path.basename(combined_all_heatmap_path)}")
+        print(f"  ✓ 所有类型合并CAM叠加图: {os.path.basename(combined_all_cam_path)}")
+
+    # 保存原始图像
+    original_output_path = os.path.join(image_output_dir, f'original.jpg')
+    cv2.imwrite(original_output_path, cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
     print(f"\n{'='*60}")
-    print(f"保存所有结果")
+    print(f"完成！所有可视化结果已保存到: {image_output_dir}")
     print(f"{'='*60}")
-    print(f"\n输出目录: {image_output_dir}")
 
-    print(f"\n【完整图片结果】")
-    print(f"  ✓ 完整图片热力图: {os.path.basename(full_heatmap_path)}")
-    print(f"  ✓ 完整图片CAM叠加图: {os.path.basename(full_cam_path)}")
-    print(f"  ✓ 完整图片原始图像: {os.path.basename(full_original_path)}")
 
-    print(f"\n【4x4切分拼接结果】")
-    cv2.imwrite(merged_heatmap_path, merged_heatmap_colored)
-    print(f"  ✓ 拼接热力图: {os.path.basename(merged_heatmap_path)}")
+if __name__ == '__main__':
+    """
+    使用示例:
+    # 处理单张图片
+    python tests_clip.py --image-name bird_flycatcher.jpg --image-text "bird flycatcher"
 
-    cv2.imwrite(merged_cam_path, merged_cam_image)
-    print(f"  ✓ 拼接CAM叠加图: {os.path.basename(merged_cam_path)}")
+    # 从JSON文件批量处理
+    python tests_clip.py --json-file images/image_metadata.json --method gradcam
 
-    cv2.imwrite(
-        original_output_path,
-        cv2.cvtColor((rgb_img * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    )
-    print(f"  ✓ 原始图像: {os.path.basename(original_output_path)}")
+    # 指定CLIP模型路径
+    python tests_clip.py --json-file images/image_metadata.json --clip-model-path /path/to/clip
+    """
+    args = get_args()
 
-    print(f"\n【4x4切分小图结果】")
-    print(f"  ✓ 所有小图结果已保存到: patches/")
-    print(f"    共 {len(patches)} 个小图，每个小图包含: original, heatmap, cam")
+    # 定义所有可用的CAM方法
+    methods = {
+        "gradcam": GradCAM,
+        "hirescam": HiResCAM,
+        "scorecam": ScoreCAM,
+        "gradcam++": GradCAMPlusPlus,
+        "ablationcam": AblationCAM,
+        "xgradcam": XGradCAM,
+        "eigencam": EigenCAM,
+        "eigengradcam": EigenGradCAM,
+        "layercam": LayerCAM,
+        "fullgrad": FullGrad,
+        "fem": FEM,
+        "gradcamelementwise": GradCAMElementWise,
+        'kpcacam': KPCA_CAM,
+        'shapleycam': ShapleyCAM,
+        'finercam': FinerCAM
+    }
 
-    print(f"\n{'='*60}")
-    print(f"完成！所有可视化结果已保存。")
-    print(f"文本描述: {args.image_text}")
-    print(f"使用设备: {args.device}")
-    print(f"{'='*60}")
+    if args.method not in methods:
+        raise ValueError(f"不支持的方法: {args.method}。可选: {list(methods.keys())}")
+
+    # 检查模型路径是否存在
+    if not os.path.exists(args.clip_model_path):
+        raise FileNotFoundError(
+            f"CLIP模型路径不存在: {args.clip_model_path}\n"
+            f"请检查路径是否正确，或使用 --clip-model-path 指定正确的路径"
+        )
+
+    cam_algorithm = methods[args.method]
+
+    # 如果指定了JSON文件，批量处理
+    if args.json_file:
+        print(f"\n{'='*60}")
+        print(f"批量处理模式：从JSON文件读取图片列表")
+        print(f"{'='*60}")
+
+        # 加载JSON元数据
+        metadata = load_json_metadata(args.json_file)
+        images_list = metadata.get('images', [])
+
+        if len(images_list) == 0:
+            print("警告: JSON文件中没有图片数据")
+            exit(1)
+
+        print(f"找到 {len(images_list)} 张图片，开始批量处理...")
+
+        # 为每张图片处理（每张图片使用自己的语义描述）
+        for idx, image_data in enumerate(images_list, 1):
+            image_path = image_data.get('path') or os.path.join(
+                metadata.get('images_dir', args.image_dir),
+                image_data['filename']
+            )
+            image_text = image_data.get('semantic', image_data.get('filename', ''))
+
+            print(f"\n{'='*60}")
+            print(f"处理进度: [{idx}/{len(images_list)}]")
+            print(f"{'='*60}")
+
+            # 为每张图片创建模型（使用对应的语义描述）
+            model = CLIPImageClassifier(
+                text_description=image_text,
+                model_path=args.clip_model_path,
+                labels=args.labels
+            ).to(torch.device(args.device))
+            model.eval()
+
+            target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
+
+            # 处理单张图片
+            try:
+                process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args)
+            except Exception as e:
+                print(f"错误: 处理图片 {image_data['filename']} 时出错: {e}")
+                continue
+
+        print(f"\n{'='*60}")
+        print(f"批量处理完成！共处理 {len(images_list)} 张图片")
+        print(f"{'='*60}")
+
+    else:
+        # 单张图片处理模式（原有逻辑）
+        print(f"\n正在加载CLIP模型...")
+        print(f"使用文本描述: {args.image_text}")
+        model = CLIPImageClassifier(
+            text_description=args.image_text,
+            model_path=args.clip_model_path,
+            labels=args.labels
+        ).to(torch.device(args.device))
+        model.eval()
+
+        # 选择目标层 - CLIP ViT的最后一层layer norm
+        target_layers = [model.clip.vision_model.encoder.layers[-1].layer_norm1]
+        print(f"目标层: {target_layers[0]}")
+
+        # 处理单张图片
+        image_path = os.path.join(args.image_dir, args.image_name)
+        process_single_image(image_path, args.image_text, model, cam_algorithm, target_layers, args)
