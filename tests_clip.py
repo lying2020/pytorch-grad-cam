@@ -41,6 +41,13 @@ except ImportError:
     print("错误: transformers包未安装。请运行: pip install transformers")
     exit(1)
 
+try:
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import normalize
+except ImportError:
+    print("错误: scikit-learn包未安装。请运行: pip install scikit-learn")
+    exit(1)
+
 current_path = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -103,6 +110,10 @@ def get_args():
                         help='组合patch的最小尺寸（默认值为patch_num-3）。例如patch_num=7时，最小size=4，会生成4x4, 4x5, 5x4, 5x5等组合')
     parser.add_argument('--target-retention-ratio', type=float, nargs='+', default=[0.3, 0.2, 0.1, 0.1],
                         help='合并热力图的目标保留比例（0-1之间）。可以是单个值（所有层级使用相同比例）或4个值（第一遍、第二遍、第三遍、第四遍分别使用）。默认[0.4, 0.2, 0.2, 0.15]')
+    parser.add_argument('--use-gmm', default=True,
+                        help='使用GMM方法发现语义部件（类似PartGCD方法）')
+    parser.add_argument('--gmm-k', type=int, default=5,
+                        help='GMM的部件数量K（默认5，CUB鸟类建议5，汽车建议6，其他建议4）')
     args = parser.parse_args()
 
     # 处理target-retention-ratio参数：支持单个值或4个值的列表
@@ -152,6 +163,160 @@ def reshape_transform(tensor, height=16, width=16):
     # 将通道维度移到第一维，像CNN一样
     result = result.transpose(2, 3).transpose(1, 2)
     return result
+
+
+# ==========================================
+# CLIP特征提取器（用于GMM部件发现）
+# ==========================================
+class CLIPFeatureExtractor:
+    """
+    CLIP模型的特征提取器，用于提取patch-level特征
+    参考 PartGCD 方法，提取倒数第二层的特征和最后一层的attention
+    """
+    def __init__(self, model):
+        """
+        初始化特征提取器
+        :param model: CLIPImageClassifier 模型
+        """
+        self.model = model
+        self.features = {}
+        self.hook_handles = []
+
+        # CLIP ViT-L 有24层，提取倒数第二层（第23层，索引22）的特征
+        # 和最后一层（第24层，索引23）的attention
+        vision_encoder = model.clip.vision_model.encoder
+        num_layers = len(vision_encoder.layers)
+
+        # 提取倒数第二层的输出（类似PartGCD的"before the last trainable block"）
+        if num_layers >= 2:
+            self.hook_handles.append(
+                vision_encoder.layers[-2].register_forward_hook(self._get_features_hook('penultimate_features'))
+            )
+        else:
+            # 如果只有一层，使用这一层
+            self.hook_handles.append(
+                vision_encoder.layers[-1].register_forward_hook(self._get_features_hook('penultimate_features'))
+            )
+
+        # 提取最后一层的attention（类似PartGCD的"class-to-patch token attention in the last block"）
+        # CLIP的encoder layer使用self_attn而不是attn
+        last_layer = vision_encoder.layers[-1]
+        self.has_attention = False
+
+        if hasattr(last_layer, 'self_attn'):
+            # CLIP使用self_attn
+            try:
+                self.hook_handles.append(
+                    last_layer.self_attn.register_forward_hook(self._get_attn_hook('last_attention'))
+                )
+                self.has_attention = True
+            except Exception as e:
+                print(f"  警告: 无法注册self_attn hook: {e}")
+        elif hasattr(last_layer, 'attn'):
+            # 某些版本可能使用attn
+            try:
+                self.hook_handles.append(
+                    last_layer.attn.register_forward_hook(self._get_attn_hook('last_attention'))
+                )
+                self.has_attention = True
+            except Exception as e:
+                print(f"  警告: 无法注册attn hook: {e}")
+
+        # 如果无法注册attention hook，将在extract时使用特征向量的L2范数作为替代
+        if not self.has_attention:
+            print("  警告: 无法找到attention模块，将使用特征向量的L2范数作为替代")
+            self.features['last_attention'] = None
+
+    def _get_features_hook(self, name):
+        def hook(module, input, output):
+            # CLIP encoder layer的输出可能是tuple: (hidden_states, attention_weights)
+            # 或者只是hidden_states tensor
+            if isinstance(output, tuple):
+                # 如果是tuple，取第一个元素（hidden_states）
+                self.features[name] = output[0]
+            else:
+                # 如果是直接的tensor
+                self.features[name] = output
+        return hook
+
+    def _get_attn_hook(self, name):
+        def hook(module, input, output):
+            # CLIP Attention 返回 (x, attn) 或 attn
+            # attn shape: [Batch, Heads, N, N]
+            if isinstance(output, tuple):
+                self.features[name] = output[1]  # 取索引 1
+            else:
+                self.features[name] = output
+        return hook
+
+    def _get_layer_attn_hook(self, name):
+        """从layer的输出中提取attention（如果无法直接访问attention模块）"""
+        def hook(module, input, output):
+            # CLIP encoder layer的输出是tuple: (hidden_states, attention_weights)
+            # 或者只是hidden_states
+            if isinstance(output, tuple) and len(output) >= 2:
+                # 如果有attention weights，使用它
+                attn_weights = output[1]  # attention weights
+                if attn_weights is not None:
+                    self.features[name] = attn_weights
+            # 如果没有attention weights，我们需要从hidden states计算
+            # 但这里我们暂时跳过，因为需要更复杂的处理
+        return hook
+
+    def extract(self, img_tensor, text_inputs):
+        """
+        提取patch特征和attention
+        :param img_tensor: 图像tensor [B, 3, 224, 224]
+        :param text_inputs: 文本输入（用于前向传播）
+        :return: patch_feats [B, N_patches, Dim], cls_attn [B, N_patches]
+        """
+        with torch.no_grad():
+            # 前向传播
+            outputs = self.model.clip(
+                pixel_values=img_tensor,
+                input_ids=text_inputs['input_ids'].to(self.model.clip.device),
+                attention_mask=text_inputs['attention_mask'].to(self.model.clip.device)
+            )
+
+        # 1. 提取 Patch 特征 (去掉 CLS token)
+        # CLIP ViT-L: [B, 257, 1024] -> [B, 256, 1024]
+        # CLIP ViT-B: [B, 197, 768] -> [B, 196, 768]
+        penultimate_feats = self.features['penultimate_features']
+
+        # 确保是tensor，如果是tuple则取第一个元素
+        if isinstance(penultimate_feats, tuple):
+            penultimate_feats = penultimate_feats[0]
+
+        # 检查是否是tensor
+        if not isinstance(penultimate_feats, torch.Tensor):
+            raise ValueError(f"penultimate_feats 应该是tensor，但得到: {type(penultimate_feats)}")
+
+        patch_feats = penultimate_feats[:, 1:, :]  # 去掉CLS token
+
+        # 2. 提取 Attention
+        if 'last_attention' in self.features and self.features['last_attention'] is not None:
+            attn = self.features['last_attention']
+
+            # 维度检查与处理
+            if attn.dim() == 4:  # [B, H, N, N]
+                attn = attn.mean(dim=1)  # Average heads -> [B, N, N]
+
+            # 取 CLS token 对其他 patch 的 attention (row 0, col 1:)
+            cls_attn = attn[:, 0, 1:]  # [B, N_patches]
+        else:
+            # 如果无法提取attention，使用特征向量的L2范数作为替代
+            # 这可以近似表示每个patch的重要性
+            print("  警告: 无法提取attention，使用特征向量的L2范数作为替代")
+            patch_feats_norm = torch.norm(patch_feats, dim=-1)  # [B, N_patches]
+            cls_attn = patch_feats_norm / (patch_feats_norm.max() + 1e-8)  # 归一化到0-1
+
+        return patch_feats, cls_attn
+
+    def release(self):
+        """释放hooks"""
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles = []
 
 
 class CLIPImageClassifier(nn.Module):
@@ -787,6 +952,147 @@ def merge_heatmaps_by_type(all_heatmaps, positions, combined_heatmaps_data, grid
     return all_merged_heatmaps, image_output_dir
 
 
+def apply_gmm_part_discovery(model, rgb_img_original, image_text, args, image_output_dir):
+    """
+    使用GMM方法发现语义部件（类似PartGCD方法）
+
+    参数:
+        model: CLIPImageClassifier 模型
+        rgb_img_original: 原始RGB图像 (numpy array, H, W, 3)
+        image_text: 语义描述文本
+        args: 参数对象
+        image_output_dir: 输出目录
+    返回:
+        part_heatmaps: dict, {part_id: heatmap} 每个部件的热力图
+    """
+    print(f"\n{'='*60}")
+    print(f"GMM语义部件发现 (K={args.gmm_k})")
+    print(f"{'='*60}")
+
+    from PIL import Image
+    from torchvision import transforms
+
+    # 图像预处理（与CLIP一致）
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ])
+
+    # 转换为PIL Image
+    img_pil = Image.fromarray((rgb_img_original * 255).astype(np.uint8))
+
+    # 预处理
+    img_t = transform(img_pil).unsqueeze(0)
+    if torch.cuda.is_available():
+        img_t = img_t.cuda()
+
+    # 准备文本输入
+    text_inputs = model.processor(
+        text=[image_text],
+        return_tensors="pt",
+        padding=True
+    )
+
+    # 创建特征提取器
+    extractor = CLIPFeatureExtractor(model)
+
+    try:
+        # 提取特征
+        feats, attn = extractor.extract(img_t, text_inputs)
+        feats = feats.cpu().numpy()[0]  # [256, dim]
+        attn = attn.cpu().numpy()[0]    # [256]
+
+        # 前景筛选：使用attention进行筛选
+        threshold = np.mean(attn) + 0.1 * np.std(attn)
+        foreground_mask = attn >= threshold
+
+        # 只使用前景patch的特征
+        if foreground_mask.sum() > 0:
+            selected_feats = feats[foreground_mask]
+        else:
+            # 如果整张图都没有显著前景，保底取TopK
+            print(f"  警告: 前景激活过低，使用 Top-100")
+            idx = np.argsort(attn)[-100:]
+            selected_feats = feats[idx]
+
+        # L2 归一化（重要：CLIP特征必须归一化）
+        selected_feats = normalize(selected_feats, norm='l2')
+
+        # 训练GMM
+        print(f"  正在拟合 GMM (K={args.gmm_k})...")
+        gmm = GaussianMixture(n_components=args.gmm_k, covariance_type='diag',
+                            random_state=42, n_init=5, max_iter=200)
+        gmm.fit(selected_feats)
+        print(f"  GMM 训练完成。")
+
+        # 对所有patch进行推理（包括背景）
+        # 推理时也必须做 L2 归一化
+        feats_normalized = normalize(feats, norm='l2')
+
+        # 预测后验概率 P(Part_k | Patch)
+        probs = gmm.predict_proba(feats_normalized)  # [N_patches, K]
+
+        # Reshape 回空间维度
+        # CLIP ViT-L使用patch size 14，输入224x224，所以是16x16 (224/14=16)
+        # CLIP ViT-B使用patch size 16，输入224x224，所以是14x14 (224/16=14)
+        num_patches = feats.shape[0]
+        if num_patches == 256:  # 16x16
+            h, w = 16, 16
+        elif num_patches == 196:  # 14x14
+            h, w = 14, 14
+        else:
+            # 自动推断
+            h = int(np.sqrt(num_patches))
+            w = h
+            if h * w != num_patches:
+                raise ValueError(f"无法推断patch空间维度，patch数量: {num_patches}")
+
+        part_maps = probs.reshape(h, w, args.gmm_k)
+
+        # 生成每个部件的热力图
+        part_heatmaps = {}
+        TARGET_SIZE = (rgb_img_original.shape[1], rgb_img_original.shape[0])
+
+        for k in range(args.gmm_k):
+            # 取出第 k 个 part 的热力图
+            heatmap = part_maps[:, :, k]
+
+            # 可视化后处理：高斯模糊 + 归一化 + 上采样
+            heatmap = cv2.GaussianBlur(heatmap, (3, 3), 0)
+            heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            heatmap_resized = cv2.resize(heatmap_norm, TARGET_SIZE, interpolation=cv2.INTER_CUBIC)
+
+            part_heatmaps[k] = heatmap_resized
+
+            # 生成可视化
+            heatmap_uint8 = np.uint8(255 * heatmap_resized)
+            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+            # CAM叠加图
+            rgb_img_for_cam = np.float32(rgb_img_original) / 255
+            cam_image = show_cam_on_image(rgb_img_for_cam, heatmap_resized, use_rgb=True)
+            cam_image = cv2.cvtColor(cam_image, cv2.COLOR_RGB2BGR)
+
+            # 保存
+            gmm_dir = os.path.join(image_output_dir, 'gmm_parts')
+            os.makedirs(gmm_dir, exist_ok=True)
+
+            heatmap_path = os.path.join(gmm_dir, f'gmm_part_{k}_heatmap.jpg')
+            cam_path = os.path.join(gmm_dir, f'gmm_part_{k}_cam.jpg')
+
+            cv2.imwrite(heatmap_path, heatmap_colored)
+            cv2.imwrite(cam_path, cam_image)
+            print(f"  ✓ Part {k} 热力图: {os.path.basename(heatmap_path)}")
+            print(f"  ✓ Part {k} CAM叠加图: {os.path.basename(cam_path)}")
+
+        return part_heatmaps
+
+    finally:
+        # 释放hooks
+        extractor.release()
+
+
 def process_single_image(image_path, image_text, model, cam_algorithm, target_layers, args, base_output_dir=None):
     """
     处理单张图片的完整流程
@@ -829,6 +1135,18 @@ def process_single_image(image_path, image_text, model, cam_algorithm, target_la
     # 第一步：处理完整图片
     full_grayscale_cam_thresholded, full_heatmap_colored, full_cam_image, full_heatmap_mean_value = \
         process_full_image(model, cam, rgb_img_original, original_shape, args)
+
+    # 可选：使用GMM方法发现语义部件
+    if args.use_gmm:
+        try:
+            part_heatmaps = apply_gmm_part_discovery(
+                model, rgb_img_original, image_text, args, image_output_dir
+            )
+            print(f"  ✓ GMM部件发现完成，共发现 {len(part_heatmaps)} 个部件")
+        except Exception as e:
+            print(f"  警告: GMM部件发现失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     # 保存完整图片结果（保持原有命名）
     full_heatmap_path = os.path.join(image_output_dir, f'full_{args.method}_heatmap.jpg')
