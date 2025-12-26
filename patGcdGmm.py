@@ -334,6 +334,126 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
         print(f"倒数第二层原始特征heatmap已保存至: {raw_output_file}")
 
         # -------------------------------------------------------
+        # 生成6个通道的14×14特征图堆叠可视化
+        # -------------------------------------------------------
+        if all_selected_indices:
+            print(f"生成6个通道的14×14特征图堆叠可视化...")
+
+            # 选择第一张图片的特征
+            first_data_idx = all_selected_indices[0]
+            item = batch_data[first_data_idx]
+            feats = item['feats']  # [196, 768] - 倒数第二层的原始特征
+
+            # 选择6个通道（可以选择前6个，或者随机选择，或者选择方差最大的6个）
+            # 这里选择前6个通道作为示例
+            num_channels_to_show = 6
+            selected_channels = list(range(num_channels_to_show))
+
+            # 存储每个通道的heatmap
+            channel_heatmaps = []
+            large_size = (300, 300)  # 每个通道heatmap的大小
+
+            for channel_idx in selected_channels:
+                # 提取该通道的特征值 [196]
+                channel_feats = feats[:, channel_idx]
+
+                # Reshape 回 14x14
+                h, w = 14, 14
+                channel_map = channel_feats.reshape(h, w)
+
+                # 高斯模糊
+                channel_blurred = cv2.GaussianBlur(channel_map, (3, 3), 0)
+                # 归一化
+                channel_norm = (channel_blurred - channel_blurred.min()) / (channel_blurred.max() - channel_blurred.min() + 1e-8)
+                channel_uint8 = np.uint8(255 * channel_norm)
+                # 上采样
+                channel_resized = cv2.resize(channel_uint8, large_size, interpolation=cv2.INTER_CUBIC)
+                # 转换为RGB colormap
+                channel_colored = cv2.applyColorMap(channel_resized, cv2.COLORMAP_JET)
+                channel_colored = cv2.cvtColor(channel_colored, cv2.COLOR_BGR2RGB)
+                channel_heatmaps.append(channel_colored)
+
+            # 堆叠参数（6个通道）
+            offset_x_per_layer = int(large_size[0] * 0.15)  # 水平偏移15%（重叠85%）
+            offset_y_per_layer = int(large_size[1] * 0.10)  # 垂直偏移10%（重叠90%）
+            max_offset_x = offset_x_per_layer * num_channels_to_show
+            max_offset_y = offset_y_per_layer * num_channels_to_show
+            canvas_size = (large_size[0] + max_offset_x + 50, large_size[1] + max_offset_y + 50)
+            canvas_channels = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
+
+            # 计算中心位置
+            center_x = canvas_size[0] // 2 - max_offset_x // 2
+            center_y = canvas_size[1] // 2 - max_offset_y // 2
+
+            # 堆叠参数
+            base_offset_x = offset_x_per_layer
+            base_offset_y = offset_y_per_layer
+
+            # 透明度和缩放设置
+            alphas_channels = [0.9 - i * 0.1 for i in range(num_channels_to_show)]
+            alphas_channels = [max(0.4, a) for a in alphas_channels]  # 最小透明度0.4
+            scales_channels = [1.0 - i * 0.03 for i in range(num_channels_to_show)]
+            scales_channels = [max(0.85, s) for s in scales_channels]  # 最小缩放0.85
+
+            # 从后往前堆叠，让后面的通道先画
+            for idx in range(len(channel_heatmaps) - 1, -1, -1):
+                channel_img = channel_heatmaps[idx]
+
+                # 缩放
+                scale = scales_channels[idx]
+                if scale < 1.0:
+                    scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
+                    scaled_channel = cv2.resize(channel_img, scaled_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    scaled_size = large_size
+                    scaled_channel = channel_img.copy()
+
+                # 计算位置
+                offset_x = idx * base_offset_x
+                offset_y = idx * base_offset_y
+                x_start = center_x - scaled_size[0]//2 + offset_x
+                y_start = center_y - scaled_size[1]//2 + offset_y
+                x_end = x_start + scaled_size[0]
+                y_end = y_start + scaled_size[1]
+
+                # 确保不越界
+                x_start_clip = max(0, x_start)
+                y_start_clip = max(0, y_start)
+                x_end_clip = min(canvas_size[0], x_end)
+                y_end_clip = min(canvas_size[1], y_end)
+
+                # 计算裁剪区域
+                crop_x_start = max(0, -x_start)
+                crop_y_start = max(0, -y_start)
+                crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
+                crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
+
+                # 叠加到画布上
+                alpha = alphas_channels[idx]
+                canvas_region = canvas_channels[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                channel_region = scaled_channel[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
+
+                # Alpha混合
+                canvas_channels[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                    canvas_region * (1 - alpha) + channel_region * alpha
+                )
+
+            # 转换为uint8
+            canvas_channels = np.clip(canvas_channels, 0, 255).astype(np.uint8)
+
+            # 保存结果
+            fig_channels, ax_channels = plt.subplots(1, 1, figsize=(8, 8))
+            ax_channels.imshow(canvas_channels)
+            ax_channels.axis('off')
+            ax_channels.set_aspect('equal')
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            channels_output_file = f"{base_output_file}_penultimate_layer_6channels_overlap.png"
+            plt.savefig(channels_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"6个通道的14×14特征图堆叠可视化已保存至: {channels_output_file}")
+
+        # -------------------------------------------------------
         # 生成重叠的立体效果图（扑克牌堆叠效果，用于论文展示）
         # -------------------------------------------------------
         if len(all_selected_indices) == 6:  # 确保是6张图片
@@ -373,21 +493,24 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
                 heatmap_images.append(heatmap_colored)
                 original_images.append(original_img_array)
 
-            # 95%重叠意味着只有5%的偏移，每张图片向右下偏移约5%的宽度
-            offset_per_layer = int(large_size[0] * 0.05)  # 约30像素
-            max_offset = offset_per_layer * 6  # 6张图片的最大累积偏移
+            # 水平重叠80%：水平偏移20%
+            # 垂直重叠90%：垂直偏移10%
+            offset_x_per_layer = int(large_size[0] * 0.20)  # 水平偏移20%
+            offset_y_per_layer = int(large_size[1] * 0.10)  # 垂直偏移10%
+            max_offset_x = offset_x_per_layer * 6  # 6张图片的最大累积水平偏移
+            max_offset_y = offset_y_per_layer * 6  # 6张图片的最大累积垂直偏移
             # 画布大小：图片大小 + 最大偏移 + 边距
-            canvas_size = (large_size[0] + max_offset + 100, large_size[1] + max_offset + 100)
+            canvas_size = (large_size[0] + max_offset_x + 100, large_size[1] + max_offset_y + 100)
             canvas = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
 
             # 计算中心位置（稍微偏左上方，为向右下方的偏移留出空间）
-            center_x = canvas_size[0] // 2 - max_offset // 2
-            center_y = canvas_size[1] // 2 - max_offset // 2
+            center_x = canvas_size[0] // 2 - max_offset_x // 2
+            center_y = canvas_size[1] // 2 - max_offset_y // 2
 
-            # 扑克牌堆叠效果：每张图片向右下方轻微偏移（水平方向向内推）
-            # 95%重叠，每层偏移约5%的宽度
-            base_offset_x = offset_per_layer
-            base_offset_y = offset_per_layer // 2  # 垂直偏移稍小，形成水平推动的效果
+            # 扑克牌堆叠效果：每张图片向右下方偏移
+            # 水平重叠80%，垂直重叠90%
+            base_offset_x = offset_x_per_layer
+            base_offset_y = offset_y_per_layer
 
             # 透明度设置：后面的图片稍微透明一些，形成层次感
             alphas = [0.9, 0.85, 0.8, 0.75, 0.7, 0.65]  # 从前往后逐渐降低
@@ -395,74 +518,134 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
             # 透视效果：后面的图片稍微小一点
             scales = [1.0, 0.98, 0.96, 0.94, 0.92, 0.90]  # 从前往后逐渐缩小
 
-            for idx, (heatmap_img, original_img_array) in enumerate(zip(heatmap_images, original_images)):
-                # 只使用heatmap，不混合原图
-                blended = heatmap_img.copy()
+            # 将6张图片分成两组（前3张一组，后3张一组）
+            group1_heatmaps = heatmap_images[:3]
+            group2_heatmaps = heatmap_images[3:6]
+            group1_originals = original_images[:3]
+            group2_originals = original_images[3:6]
 
-                # 缩放（透视效果）
-                scale = scales[idx]
+            # 堆叠参数（每组3张）
+            offset_x_per_layer_3 = int(large_size[0] * 0.20)  # 水平偏移20%
+            offset_y_per_layer_3 = int(large_size[1] * 0.10)  # 垂直偏移10%
+            max_offset_x_3 = offset_x_per_layer_3 * 3
+            max_offset_y_3 = offset_y_per_layer_3 * 3
+            canvas_size_3 = (large_size[0] + max_offset_x_3 + 100, large_size[1] + max_offset_y_3 + 100)
+            center_x_3 = canvas_size_3[0] // 2 - max_offset_x_3 // 2
+            center_y_3 = canvas_size_3[1] // 2 - max_offset_y_3 // 2
+            base_offset_x_3 = offset_x_per_layer_3
+            base_offset_y_3 = offset_y_per_layer_3
+            alphas_3 = [0.9, 0.85, 0.8]
+            scales_3 = [1.0, 0.95, 0.9]
+
+            # -------------------------------------------------------
+            # 生成热力图第一组堆叠图
+            # -------------------------------------------------------
+            canvas_hm1 = np.ones((canvas_size_3[1], canvas_size_3[0], 3), dtype=np.float32) * 255.0
+            for idx, heatmap_img in enumerate(group1_heatmaps):
+                blended = heatmap_img.copy()
+                scale = scales_3[idx]
                 if scale < 1.0:
                     scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
                     blended = cv2.resize(blended, scaled_size, interpolation=cv2.INTER_LINEAR)
                 else:
                     scaled_size = large_size
 
-                # 计算在画布上的位置（向右下方偏移，形成堆叠效果）
-                offset_x = idx * base_offset_x
-                offset_y = idx * base_offset_y
-                x_start = center_x - scaled_size[0]//2 + offset_x
-                y_start = center_y - scaled_size[1]//2 + offset_y
+                offset_x = idx * base_offset_x_3
+                offset_y = idx * base_offset_y_3
+                x_start = center_x_3 - scaled_size[0]//2 + offset_x
+                y_start = center_y_3 - scaled_size[1]//2 + offset_y
                 x_end = x_start + scaled_size[0]
                 y_end = y_start + scaled_size[1]
 
-                # 确保不越界
                 x_start_clip = max(0, x_start)
                 y_start_clip = max(0, y_start)
-                x_end_clip = min(canvas_size[0], x_end)
-                y_end_clip = min(canvas_size[1], y_end)
+                x_end_clip = min(canvas_size_3[0], x_end)
+                y_end_clip = min(canvas_size_3[1], y_end)
 
-                # 计算需要从图片中裁剪的区域
                 crop_x_start = max(0, -x_start)
                 crop_y_start = max(0, -y_start)
                 crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
                 crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
 
-                # 叠加到画布上
-                alpha = alphas[idx]
-                canvas_region = canvas[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                alpha = alphas_3[idx]
+                canvas_region = canvas_hm1[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
                 blended_region = blended[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
 
-                # Alpha混合
-                canvas[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                canvas_hm1[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
                     canvas_region * (1 - alpha) + blended_region * alpha
                 )
 
-            # 转换为uint8
-            canvas = np.clip(canvas, 0, 255).astype(np.uint8)
-
-            # 保存结果
-            fig_overlap, ax_overlap = plt.subplots(1, 1, figsize=(10, 10))
-            ax_overlap.imshow(canvas)
-            ax_overlap.axis('off')
-            ax_overlap.set_aspect('equal')
+            canvas_hm1 = np.clip(canvas_hm1, 0, 255).astype(np.uint8)
+            fig_hm1, ax_hm1 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_hm1.imshow(canvas_hm1)
+            ax_hm1.axis('off')
+            ax_hm1.set_aspect('equal')
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-            overlap_output_file = f"{base_output_file}_penultimate_layer_overlap.png"
-            plt.savefig(overlap_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+            overlap_output_file_hm1 = f"{base_output_file}_penultimate_layer_overlap_group1.png"
+            plt.savefig(overlap_output_file_hm1, dpi=300, bbox_inches='tight', pad_inches=0)
             plt.close()
-            print(f"重叠立体效果图（扑克牌堆叠）已保存至: {overlap_output_file}")
+            print(f"热力图第一组堆叠图已保存至: {overlap_output_file_hm1}")
 
             # -------------------------------------------------------
-            # 生成原图的堆叠图（使用相同的堆叠方式）
+            # 生成热力图第二组堆叠图
             # -------------------------------------------------------
-            print(f"生成原图堆叠图（扑克牌堆叠效果）...")
+            canvas_hm2 = np.ones((canvas_size_3[1], canvas_size_3[0], 3), dtype=np.float32) * 255.0
+            for idx, heatmap_img in enumerate(group2_heatmaps):
+                blended = heatmap_img.copy()
+                scale = scales_3[idx]
+                if scale < 1.0:
+                    scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
+                    blended = cv2.resize(blended, scaled_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    scaled_size = large_size
 
-            # 使用相同的堆叠参数
-            canvas_orig = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
+                offset_x = idx * base_offset_x_3
+                offset_y = idx * base_offset_y_3
+                x_start = center_x_3 - scaled_size[0]//2 + offset_x
+                y_start = center_y_3 - scaled_size[1]//2 + offset_y
+                x_end = x_start + scaled_size[0]
+                y_end = y_start + scaled_size[1]
 
-            for idx, original_img_array in enumerate(original_images):
-                # 缩放（透视效果）
-                scale = scales[idx]
+                x_start_clip = max(0, x_start)
+                y_start_clip = max(0, y_start)
+                x_end_clip = min(canvas_size_3[0], x_end)
+                y_end_clip = min(canvas_size_3[1], y_end)
+
+                crop_x_start = max(0, -x_start)
+                crop_y_start = max(0, -y_start)
+                crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
+                crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
+
+                alpha = alphas_3[idx]
+                canvas_region = canvas_hm2[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                blended_region = blended[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
+
+                canvas_hm2[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                    canvas_region * (1 - alpha) + blended_region * alpha
+                )
+
+            canvas_hm2 = np.clip(canvas_hm2, 0, 255).astype(np.uint8)
+            fig_hm2, ax_hm2 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_hm2.imshow(canvas_hm2)
+            ax_hm2.axis('off')
+            ax_hm2.set_aspect('equal')
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            overlap_output_file_hm2 = f"{base_output_file}_penultimate_layer_overlap_group2.png"
+            plt.savefig(overlap_output_file_hm2, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"热力图第二组堆叠图已保存至: {overlap_output_file_hm2}")
+
+            # -------------------------------------------------------
+            # 生成原图的堆叠图（分成两组，每组3张）
+            # -------------------------------------------------------
+            print(f"生成原图堆叠图（分成两组，每组3张）...")
+
+            # -------------------------------------------------------
+            # 生成原图第一组堆叠图
+            # -------------------------------------------------------
+            canvas_orig1 = np.ones((canvas_size_3[1], canvas_size_3[0], 3), dtype=np.float32) * 255.0
+            for idx, original_img_array in enumerate(group1_originals):
+                scale = scales_3[idx]
                 if scale < 1.0:
                     scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
                     scaled_img = cv2.resize(original_img_array, scaled_size, interpolation=cv2.INTER_LINEAR)
@@ -470,7 +653,247 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
                     scaled_size = large_size
                     scaled_img = original_img_array.copy()
 
-                # 计算在画布上的位置（向右下方偏移，形成堆叠效果）
+                offset_x = idx * base_offset_x_3
+                offset_y = idx * base_offset_y_3
+                x_start = center_x_3 - scaled_size[0]//2 + offset_x
+                y_start = center_y_3 - scaled_size[1]//2 + offset_y
+                x_end = x_start + scaled_size[0]
+                y_end = y_start + scaled_size[1]
+
+                x_start_clip = max(0, x_start)
+                y_start_clip = max(0, y_start)
+                x_end_clip = min(canvas_size_3[0], x_end)
+                y_end_clip = min(canvas_size_3[1], y_end)
+
+                crop_x_start = max(0, -x_start)
+                crop_y_start = max(0, -y_start)
+                crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
+                crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
+
+                alpha = alphas_3[idx]
+                canvas_region = canvas_orig1[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                scaled_region = scaled_img[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
+
+                canvas_orig1[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                    canvas_region * (1 - alpha) + scaled_region * alpha
+                )
+
+            canvas_orig1 = np.clip(canvas_orig1, 0, 255).astype(np.uint8)
+            fig_orig1, ax_orig1 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_orig1.imshow(canvas_orig1)
+            ax_orig1.axis('off')
+            ax_orig1.set_aspect('equal')
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            orig_output_file_1 = f"{base_output_file}_original_images_overlap_group1.png"
+            plt.savefig(orig_output_file_1, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"原图第一组堆叠图已保存至: {orig_output_file_1}")
+
+            # -------------------------------------------------------
+            # 生成原图第二组堆叠图
+            # -------------------------------------------------------
+            canvas_orig2 = np.ones((canvas_size_3[1], canvas_size_3[0], 3), dtype=np.float32) * 255.0
+            for idx, original_img_array in enumerate(group2_originals):
+                scale = scales_3[idx]
+                if scale < 1.0:
+                    scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
+                    scaled_img = cv2.resize(original_img_array, scaled_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    scaled_size = large_size
+                    scaled_img = original_img_array.copy()
+
+                offset_x = idx * base_offset_x_3
+                offset_y = idx * base_offset_y_3
+                x_start = center_x_3 - scaled_size[0]//2 + offset_x
+                y_start = center_y_3 - scaled_size[1]//2 + offset_y
+                x_end = x_start + scaled_size[0]
+                y_end = y_start + scaled_size[1]
+
+                x_start_clip = max(0, x_start)
+                y_start_clip = max(0, y_start)
+                x_end_clip = min(canvas_size_3[0], x_end)
+                y_end_clip = min(canvas_size_3[1], y_end)
+
+                crop_x_start = max(0, -x_start)
+                crop_y_start = max(0, -y_start)
+                crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
+                crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
+
+                alpha = alphas_3[idx]
+                canvas_region = canvas_orig2[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                scaled_region = scaled_img[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
+
+                canvas_orig2[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                    canvas_region * (1 - alpha) + scaled_region * alpha
+                )
+
+            canvas_orig2 = np.clip(canvas_orig2, 0, 255).astype(np.uint8)
+            fig_orig2, ax_orig2 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_orig2.imshow(canvas_orig2)
+            ax_orig2.axis('off')
+            ax_orig2.set_aspect('equal')
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            orig_output_file_2 = f"{base_output_file}_original_images_overlap_group2.png"
+            plt.savefig(orig_output_file_2, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"原图第二组堆叠图已保存至: {orig_output_file_2}")
+
+            # -------------------------------------------------------
+            # 生成5个part热力图重叠后分成两组堆叠的图
+            # -------------------------------------------------------
+            print(f"生成5个part热力图重叠后分成两组堆叠的图...")
+
+            # 对每张图片，提取所有5个part的热力图并重叠
+            overlapped_part_heatmaps = []
+
+            for data_idx in all_selected_indices:
+                item = batch_data[data_idx]
+                feats = item['feats']  # [196, 768]
+
+                # L2归一化
+                feats = normalize(feats, norm='l2')
+
+                # 预测后验概率
+                probs = gmm.predict_proba(feats)  # [196, K]
+
+                # Reshape 回 14x14
+                h, w = 14, 14
+                part_maps = probs.reshape(h, w, K)  # [14, 14, K]
+
+                # 将所有5个part的热力图重叠在一起
+                large_size = (600, 600)
+                # 使用白色背景，让结果更亮
+                overlapped_canvas = np.ones((large_size[1], large_size[0], 3), dtype=np.float32) * 255.0
+
+                # 存储所有part的热力图
+                part_heatmaps = []
+
+                # 对每个part，转换为热力图
+                for k in range(K):
+                    heatmap = part_maps[:, :, k]  # [14, 14]
+
+                    # 高斯模糊
+                    heatmap_blurred = cv2.GaussianBlur(heatmap, (3, 3), 0)
+                    # 归一化
+                    heatmap_norm = (heatmap_blurred - heatmap_blurred.min()) / (heatmap_blurred.max() - heatmap_blurred.min() + 1e-8)
+                    heatmap_uint8 = np.uint8(255 * heatmap_norm)
+                    # 上采样
+                    heatmap_resized = cv2.resize(heatmap_uint8, large_size, interpolation=cv2.INTER_CUBIC)
+                    # 转换为RGB colormap
+                    heatmap_colored = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+                    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+                    part_heatmaps.append(heatmap_colored.astype(np.float32))
+
+                # 使用加权平均混合，但使用更高的权重让结果更亮
+                # 对每个part使用较高的透明度，让重叠效果更明显
+                total_weight = 0.0
+                weighted_sum = np.zeros((large_size[1], large_size[0], 3), dtype=np.float32)
+
+                for part_hm in part_heatmaps:
+                    part_weight = 0.4  # 每个part的权重，5个part总和为2.0，会超过1.0，让结果更亮
+                    weighted_sum += part_hm * part_weight
+                    total_weight += part_weight
+
+                # 归一化并混合到白色背景上
+                if total_weight > 0:
+                    avg_heatmap = weighted_sum / total_weight
+                    # 与白色背景混合，使用较高的alpha让热力图更明显
+                    overlapped_canvas = overlapped_canvas * 0.3 + avg_heatmap * 0.7
+
+                # 转换为uint8
+                overlapped_canvas = np.clip(overlapped_canvas, 0, 255).astype(np.uint8)
+                overlapped_part_heatmaps.append(overlapped_canvas)
+
+            # 将6张图片分成两组（前3张一组，后3张一组）
+            group1_heatmaps = overlapped_part_heatmaps[:3]
+            group2_heatmaps = overlapped_part_heatmaps[3:6]
+
+            # 堆叠参数（每组3张）
+            # 水平重叠80%：水平偏移20%
+            # 垂直重叠90%：垂直偏移10%
+            offset_x_per_layer = int(large_size[0] * 0.20)  # 水平偏移20%
+            offset_y_per_layer = int(large_size[1] * 0.10)  # 垂直偏移10%
+            max_offset_x = offset_x_per_layer * 3
+            max_offset_y = offset_y_per_layer * 3
+            canvas_size = (large_size[0] + max_offset_x + 100, large_size[1] + max_offset_y + 100)
+
+            # 生成第一组堆叠图
+            canvas_group1 = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
+            center_x = canvas_size[0] // 2 - max_offset_x // 2
+            center_y = canvas_size[1] // 2 - max_offset_y // 2
+            base_offset_x = offset_x_per_layer
+            base_offset_y = offset_y_per_layer
+            # 调整透明度，让后面的图片更明显（后面的图片更不透明，前面的图片更透明）
+            alphas_group = [0.6, 0.75, 0.85]  # 从前往后：第一张更透明，后面的更不透明
+            scales_group = [1.0, 0.95, 0.9]
+
+            # 从后往前堆叠，让后面的图片先画，前面的图片后画
+            for idx in range(len(group1_heatmaps) - 1, -1, -1):  # 从后往前遍历
+                heatmap_img = group1_heatmaps[idx]
+                scale = scales_group[idx]
+                if scale < 1.0:
+                    scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
+                    scaled_img = cv2.resize(heatmap_img, scaled_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    scaled_size = large_size
+                    scaled_img = heatmap_img.copy()
+
+                # 将正方形拍扁成菱形（沿着左上到右下的对角线压缩）
+                h, w = scaled_img.shape[:2]
+                # 菱形变换：沿着对角线方向压缩，让正方形变成菱形
+                # 左上角和右下角向内收缩，形成菱形的尖角
+                squeeze_factor = 0.25  # 收缩因子，可以调整（0.2-0.3之间效果较明显）
+
+                # 原始正方形的四个角点（中心为原点）
+                center_x, center_y = w // 2, h // 2
+                src_points = np.array([
+                    [0, 0],           # 左上
+                    [w, 0],           # 右上
+                    [w, h],           # 右下
+                    [0, h]            # 左下
+                ], dtype=np.float32)
+
+                # 变换后的菱形四个角点
+                # 沿着左上到右下的对角线方向压缩
+                # 左上角和右下角向内收缩，右上角和左下角保持或稍微外扩
+                offset = w * squeeze_factor
+                dst_points = np.array([
+                    [offset, offset],                    # 左上：向内收缩
+                    [w - offset * 0.5, offset * 0.5],    # 右上：稍微向内
+                    [w - offset, h - offset],            # 右下：向内收缩
+                    [offset * 0.5, h - offset * 0.5]     # 左下：稍微向内
+                ], dtype=np.float32)
+
+                # 计算透视变换矩阵
+                M_perspective = cv2.getPerspectiveTransform(src_points, dst_points)
+
+                # 计算变换后的画布大小（减小尺寸增加，避免遮挡后面的图片）
+                new_w = int(w * 1.05)  # 从1.1减小到1.05
+                new_h = int(h * 1.05)
+
+                # 应用透视变换
+                scaled_img = cv2.warpPerspective(scaled_img, M_perspective, (new_w, new_h),
+                                                borderMode=cv2.BORDER_CONSTANT,
+                                                borderValue=(255, 255, 255))
+
+                # 创建mask，只保留菱形区域内的像素
+                # 创建一个全0的mask（单通道）
+                mask = np.zeros((new_h, new_w), dtype=np.uint8)
+
+                # 将变换后的四个角点转换为整数坐标
+                mask_points = dst_points.astype(np.int32)
+
+                # 在mask上填充菱形区域（使用255表示不透明区域）
+                cv2.fillPoly(mask, [mask_points], 255)
+
+                # 将mask应用到图片：只保留菱形区域内的像素，其他区域设为白色（背景色）
+                mask_3d = mask[:, :, np.newaxis] / 255.0
+                scaled_img = (scaled_img.astype(np.float32) * mask_3d +
+                             255.0 * (1 - mask_3d)).astype(np.uint8)
+
+                # 更新尺寸
+                scaled_size = (new_w, new_h)
+
                 offset_x = idx * base_offset_x
                 offset_y = idx * base_offset_y
                 x_start = center_x - scaled_size[0]//2 + offset_x
@@ -478,42 +901,146 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
                 x_end = x_start + scaled_size[0]
                 y_end = y_start + scaled_size[1]
 
-                # 确保不越界
                 x_start_clip = max(0, x_start)
                 y_start_clip = max(0, y_start)
                 x_end_clip = min(canvas_size[0], x_end)
                 y_end_clip = min(canvas_size[1], y_end)
 
-                # 计算需要从图片中裁剪的区域
                 crop_x_start = max(0, -x_start)
                 crop_y_start = max(0, -y_start)
                 crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
                 crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
 
-                # 叠加到画布上
-                alpha = alphas[idx]
-                canvas_region = canvas_orig[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                alpha = alphas_group[idx]
+                canvas_region = canvas_group1[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
                 scaled_region = scaled_img[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
 
-                # Alpha混合
-                canvas_orig[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                canvas_group1[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
                     canvas_region * (1 - alpha) + scaled_region * alpha
                 )
 
-            # 转换为uint8
-            canvas_orig = np.clip(canvas_orig, 0, 255).astype(np.uint8)
+            canvas_group1 = np.clip(canvas_group1, 0, 255).astype(np.uint8)
 
-            # 保存结果
-            fig_orig_overlap, ax_orig_overlap = plt.subplots(1, 1, figsize=(10, 10))
-            ax_orig_overlap.imshow(canvas_orig)
-            ax_orig_overlap.axis('off')
-            ax_orig_overlap.set_aspect('equal')
+            # 保存第一组
+            fig_group1, ax_group1 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_group1.imshow(canvas_group1)
+            ax_group1.axis('off')
+            ax_group1.set_aspect('equal')
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
-            orig_overlap_output_file = f"{base_output_file}_original_images_overlap.png"
-            plt.savefig(orig_overlap_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+            group1_output_file = f"{base_output_file}_parts_overlapped_group1.png"
+            plt.savefig(group1_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
             plt.close()
-            print(f"原图堆叠图（扑克牌堆叠）已保存至: {orig_overlap_output_file}")
+            print(f"5个part重叠后第一组堆叠图已保存至: {group1_output_file}")
+
+            # 生成第二组堆叠图
+            canvas_group2 = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
+
+            # 从后往前堆叠，让后面的图片先画，前面的图片后画
+            for idx in range(len(group2_heatmaps) - 1, -1, -1):  # 从后往前遍历
+                heatmap_img = group2_heatmaps[idx]
+                scale = scales_group[idx]
+                if scale < 1.0:
+                    scaled_size = (int(large_size[0] * scale), int(large_size[1] * scale))
+                    scaled_img = cv2.resize(heatmap_img, scaled_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    scaled_size = large_size
+                    scaled_img = heatmap_img.copy()
+
+                # 将正方形拍扁成菱形（沿着左上到右下的对角线压缩）
+                h, w = scaled_img.shape[:2]
+                # 菱形变换：沿着对角线方向压缩，让正方形变成菱形
+                # 左上角和右下角向内收缩，形成菱形的尖角
+                squeeze_factor = 0.25  # 收缩因子，可以调整（0.2-0.3之间效果较明显）
+
+                # 原始正方形的四个角点（中心为原点）
+                center_x, center_y = w // 2, h // 2
+                src_points = np.array([
+                    [0, 0],           # 左上
+                    [w, 0],           # 右上
+                    [w, h],           # 右下
+                    [0, h]            # 左下
+                ], dtype=np.float32)
+
+                # 变换后的菱形四个角点
+                # 沿着左上到右下的对角线方向压缩
+                # 左上角和右下角向内收缩，右上角和左下角保持或稍微外扩
+                offset = w * squeeze_factor
+                dst_points = np.array([
+                    [offset, offset],                    # 左上：向内收缩
+                    [w - offset * 0.5, offset * 0.5],    # 右上：稍微向内
+                    [w - offset, h - offset],            # 右下：向内收缩
+                    [offset * 0.5, h - offset * 0.5]     # 左下：稍微向内
+                ], dtype=np.float32)
+
+                # 计算透视变换矩阵
+                M_perspective = cv2.getPerspectiveTransform(src_points, dst_points)
+
+                # 计算变换后的画布大小（减小尺寸增加，避免遮挡后面的图片）
+                new_w = int(w * 1.05)  # 从1.1减小到1.05
+                new_h = int(h * 1.05)
+
+                # 应用透视变换
+                scaled_img = cv2.warpPerspective(scaled_img, M_perspective, (new_w, new_h),
+                                                borderMode=cv2.BORDER_CONSTANT,
+                                                borderValue=(255, 255, 255))
+
+                # 创建mask，只保留菱形区域内的像素
+                # 创建一个全0的mask（单通道）
+                mask = np.zeros((new_h, new_w), dtype=np.uint8)
+
+                # 将变换后的四个角点转换为整数坐标
+                mask_points = dst_points.astype(np.int32)
+
+                # 在mask上填充菱形区域（使用255表示不透明区域）
+                cv2.fillPoly(mask, [mask_points], 255)
+
+                # 将mask应用到图片：只保留菱形区域内的像素，其他区域设为白色（背景色）
+                mask_3d = mask[:, :, np.newaxis] / 255.0
+                scaled_img = (scaled_img.astype(np.float32) * mask_3d +
+                             255.0 * (1 - mask_3d)).astype(np.uint8)
+
+                # 更新尺寸
+                scaled_size = (new_w, new_h)
+
+                offset_x = idx * base_offset_x
+                offset_y = idx * base_offset_y
+                x_start = center_x - scaled_size[0]//2 + offset_x
+                y_start = center_y - scaled_size[1]//2 + offset_y
+                x_end = x_start + scaled_size[0]
+                y_end = y_start + scaled_size[1]
+
+                x_start_clip = max(0, x_start)
+                y_start_clip = max(0, y_start)
+                x_end_clip = min(canvas_size[0], x_end)
+                y_end_clip = min(canvas_size[1], y_end)
+
+                crop_x_start = max(0, -x_start)
+                crop_y_start = max(0, -y_start)
+                crop_x_end = crop_x_start + (x_end_clip - x_start_clip)
+                crop_y_end = crop_y_start + (y_end_clip - y_start_clip)
+
+                alpha = alphas_group[idx]
+                canvas_region = canvas_group2[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                scaled_region = scaled_img[crop_y_start:crop_y_end, crop_x_start:crop_x_end].astype(np.float32)
+
+                canvas_group2[y_start_clip:y_end_clip, x_start_clip:x_end_clip] = (
+                    canvas_region * (1 - alpha) + scaled_region * alpha
+                )
+
+            canvas_group2 = np.clip(canvas_group2, 0, 255).astype(np.uint8)
+
+            # 保存第二组
+            fig_group2, ax_group2 = plt.subplots(1, 1, figsize=(10, 10))
+            ax_group2.imshow(canvas_group2)
+            ax_group2.axis('off')
+            ax_group2.set_aspect('equal')
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            group2_output_file = f"{base_output_file}_parts_overlapped_group2.png"
+            plt.savefig(group2_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"5个part重叠后第二组堆叠图已保存至: {group2_output_file}")
         else:
             print(f"注意：当前选中了 {len(all_selected_indices)} 张图片，不是6张，跳过旋转重叠图的生成")
 
@@ -683,18 +1210,22 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
 
                     # 计算堆叠参数
                     num_heatmaps = len(heatmap_images)
-                    offset_per_layer = int(large_size[0] * 0.05)  # 约30像素
-                    max_offset = offset_per_layer * num_heatmaps
-                    canvas_size = (large_size[0] + max_offset + 100, large_size[1] + max_offset + 100)
+                    # 水平重叠80%：水平偏移20%
+                    # 垂直重叠90%：垂直偏移10%
+                    offset_x_per_layer = int(large_size[0] * 0.20)  # 水平偏移20%
+                    offset_y_per_layer = int(large_size[1] * 0.10)  # 垂直偏移10%
+                    max_offset_x = offset_x_per_layer * num_heatmaps
+                    max_offset_y = offset_y_per_layer * num_heatmaps
+                    canvas_size = (large_size[0] + max_offset_x + 100, large_size[1] + max_offset_y + 100)
                     canvas = np.ones((canvas_size[1], canvas_size[0], 3), dtype=np.float32) * 255.0
 
                     # 计算中心位置
-                    center_x = canvas_size[0] // 2 - max_offset // 2
-                    center_y = canvas_size[1] // 2 - max_offset // 2
+                    center_x = canvas_size[0] // 2 - max_offset_x // 2
+                    center_y = canvas_size[1] // 2 - max_offset_y // 2
 
                     # 堆叠参数
-                    base_offset_x = offset_per_layer
-                    base_offset_y = offset_per_layer // 2
+                    base_offset_x = offset_x_per_layer
+                    base_offset_y = offset_y_per_layer
 
                     # 透明度和缩放设置
                     alphas = [0.9 - i * 0.05 for i in range(num_heatmaps)]
@@ -757,6 +1288,42 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
                     plt.savefig(parts_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
                     plt.close()
                     print(f"非背景part堆叠图已保存至: {parts_output_file} (包含 {num_heatmaps} 个part)")
+
+                    # -------------------------------------------------------
+                    # 生成4个非背景part重叠在一起的可视化（不是堆叠，而是叠加）
+                    # -------------------------------------------------------
+                    # 将所有非背景part重叠在一起
+                    overlapped_canvas = np.ones((large_size[1], large_size[0], 3), dtype=np.float32) * 255.0
+
+                    # 使用加权平均混合，让结果更亮
+                    total_weight = 0.0
+                    weighted_sum = np.zeros((large_size[1], large_size[0], 3), dtype=np.float32)
+
+                    for part_hm in heatmap_images:
+                        part_weight = 0.4  # 每个part的权重
+                        weighted_sum += part_hm.astype(np.float32) * part_weight
+                        total_weight += part_weight
+
+                    # 归一化并混合到白色背景上
+                    if total_weight > 0:
+                        avg_heatmap = weighted_sum / total_weight
+                        # 与白色背景混合，使用较高的alpha让热力图更明显
+                        overlapped_canvas = overlapped_canvas * 0.3 + avg_heatmap * 0.7
+
+                    # 转换为uint8
+                    overlapped_canvas = np.clip(overlapped_canvas, 0, 255).astype(np.uint8)
+
+                    # 保存结果
+                    fig_overlapped, ax_overlapped = plt.subplots(1, 1, figsize=(8, 8))
+                    ax_overlapped.imshow(overlapped_canvas)
+                    ax_overlapped.axis('off')
+                    ax_overlapped.set_aspect('equal')
+                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+                    overlapped_output_file = f"{base_output_file}_group{group_idx+1}_img{img_idx+1}_non_background_parts_overlapped.png"
+                    plt.savefig(overlapped_output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                    print(f"4个非背景part重叠图已保存至: {overlapped_output_file}")
                 else:
                     print(f"注意：图片 {img_idx+1} 的非背景part数量为 {len(non_background_heatmaps)}，跳过堆叠图生成（数量过多或为0）")
 
