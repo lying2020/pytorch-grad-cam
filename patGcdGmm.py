@@ -14,6 +14,16 @@ import glob
 import os
 import random
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+output_dir = os.path.join(current_dir, 'outputs')
+os.makedirs(output_dir, exist_ok=True)
+
+results_dir = os.path.join(output_dir, 'results')
+os.makedirs(results_dir, exist_ok=True)
+
+comparison_dir = os.path.join(output_dir, 'comparison')
+os.makedirs(comparison_dir, exist_ok=True)
+
 # ==========================================
 # 1. 特征提取器 (Feature Extractor)
 # ==========================================
@@ -1429,50 +1439,357 @@ def run_partgcd_visualization(image_paths, K=4, output_file="outputs/results/par
     #     print(f"全局背景类别可视化已保存至: {bg_all_output_file} (显示 {max_display} 张图片)")
 
 # ==========================================
+# 3.5. 多数据集对比可视化函数
+# ==========================================
+def run_multi_dataset_comparison(dataset_configs, output_file="outputs/results/multi_dataset_comparison.png"):
+    """
+    生成多数据集对比可视化：每个数据集一行，每行包含多张图片，每张图片包含原图+K个part
+    :param dataset_configs: 列表，每个元素为 {'path_pattern': str, 'name': str, 'K': int, 'num_images': int 或 'img_indices': list}
+                            path_pattern: 图片路径模式
+                            name: 数据集名称
+                            K: 部件数量
+                            num_images: 选择几张图片（随机选择，默认3）
+                            img_indices: 指定图片索引列表（如 [0, 1, 2]），优先级高于num_images
+    :param output_file: 输出文件路径
+    """
+    TARGET_SIZE = (256, 256)
+
+    # 初始化特征提取器（所有数据集共享）
+    print("正在初始化特征提取器...")
+    extractor = FeatureExtractor()
+
+    # 存储所有数据集的结果
+    all_results = []
+
+    # 为每个数据集处理
+    for config in dataset_configs:
+        path_pattern = config['path_pattern']
+        dataset_name = config['name']
+        K = config['K']
+        num_images = config.get('num_images', 3)  # 默认选择3张图片
+        img_indices = config.get('img_indices', None)  # 可以指定具体的图片索引
+
+        print(f"\n{'='*60}")
+        print(f"处理数据集: {dataset_name} (K={K})")
+        print(f"{'='*60}")
+
+        # 搜索图片
+        img_list = glob.glob(path_pattern)
+        if len(img_list) == 0:
+            print(f"警告: 未找到匹配 '{path_pattern}' 的图片，跳过该数据集")
+            continue
+
+        # 确定要选择的图片索引
+        if img_indices is not None:
+            # 使用指定的索引
+            selected_indices = [idx for idx in img_indices if idx < len(img_list)]
+            if len(selected_indices) == 0:
+                print(f"警告: 指定的图片索引都超出范围，使用前{num_images}张")
+                selected_indices = list(range(min(num_images, len(img_list))))
+        else:
+            # 随机选择或顺序选择
+            if len(img_list) <= num_images:
+                selected_indices = list(range(len(img_list)))
+            else:
+                # 随机选择num_images张
+                selected_indices = sorted(random.sample(range(len(img_list)), num_images))
+
+        print(f"找到 {len(img_list)} 张图片，选择 {len(selected_indices)} 张: 索引 {selected_indices}")
+
+        # 存储该数据集的所有图片结果
+        dataset_results = []
+
+        # 第一步：收集所有选中图片的特征，用于训练GMM
+        pool_features = []
+        all_img_data = []  # 存储所有图片的原始数据
+
+        print("提取特征用于GMM训练...")
+        for img_idx in selected_indices:
+            img_path = img_list[img_idx]
+            try:
+                img = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                print(f"无法读取: {img_path}, 错误: {e}")
+                continue
+
+            img_t = transform(img).unsqueeze(0)
+            if torch.cuda.is_available():
+                img_t = img_t.cuda()
+
+            feats, attn = extractor.extract(img_t)
+            feats = feats.cpu().numpy()[0]  # [196, 768]
+            attn = attn.cpu().numpy()[0]    # [196]
+
+            # 前景筛选
+            threshold = np.mean(attn) + 0.1 * np.std(attn)
+            foreground_mask = attn >= threshold
+
+            if foreground_mask.sum() > 0:
+                selected_feats = feats[foreground_mask]
+            else:
+                idx = np.argsort(attn)[-50:]
+                selected_feats = feats[idx]
+
+            pool_features.append(selected_feats)
+            all_img_data.append({
+                'img': img,
+                'feats': feats,
+                'attn': attn,
+                'img_path': img_path
+            })
+
+        if not pool_features:
+            print(f"警告: 数据集 {dataset_name} 没有成功提取任何特征，跳过")
+            continue
+
+        # 合并所有特征并归一化
+        pool_features = np.concatenate(pool_features, axis=0)
+        pool_features = normalize(pool_features, norm='l2')
+
+        # 训练GMM
+        print(f"训练GMM (K={K})，使用 {len(all_img_data)} 张图片的特征...")
+        gmm = GaussianMixture(n_components=K, covariance_type='diag', random_state=42, n_init=5, max_iter=200)
+        gmm.fit(pool_features)
+        print("GMM 训练完成")
+
+        # 第二步：对每张选中的图片进行推理
+        print("对每张图片进行推理...")
+        for img_data in all_img_data:
+            feats = img_data['feats']
+            feats_normalized = normalize(feats, norm='l2')
+            probs = gmm.predict_proba(feats_normalized)  # [196, K]
+
+            h, w = 14, 14
+            part_maps = probs.reshape(h, w, K)
+
+            dataset_results.append({
+                'original_img': img_data['img'],
+                'part_maps': part_maps,
+                'img_path': img_data['img_path']
+            })
+
+        # 保存该数据集的所有结果
+        all_results.append({
+            'dataset_name': dataset_name,
+            'images': dataset_results,  # 多张图片的结果
+            'K': K
+        })
+
+    if not all_results:
+        print("错误: 没有成功处理任何数据集")
+        return
+
+    # 生成可视化
+    print(f"\n生成对比可视化...")
+    num_datasets = len(all_results)
+
+    # 计算每行需要的列数：每张图片需要 (1原图 + K个part) 列
+    # 找到每行最多需要多少列
+    max_cols_per_row = 0
+    for result in all_results:
+        num_imgs = len(result['images'])
+        K = result['K']
+        cols_per_row = num_imgs * (1 + K)  # 每张图片：1原图 + K个part
+        max_cols_per_row = max(max_cols_per_row, cols_per_row)
+
+    num_rows = num_datasets
+    num_cols = max_cols_per_row
+
+    # 创建主图
+    fig, axes = plt.subplots(num_rows, num_cols,
+                            figsize=(2.0 * num_cols, 2.5 * num_rows),
+                            gridspec_kw={'hspace': 0.1, 'wspace': 0.05,
+                                        'left': 0, 'right': 1, 'top': 0.96, 'bottom': 0})
+
+    # 确保axes是2D数组
+    if num_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if num_cols == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    # 辅助函数：绘制热力图
+    def draw_heatmap_simple(ax, original_img, heatmap):
+        heatmap = cv2.GaussianBlur(heatmap, (3, 3), 0)
+        heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        heatmap_uint8 = np.uint8(255 * heatmap_norm)
+        heatmap_resized = cv2.resize(heatmap_uint8, TARGET_SIZE, interpolation=cv2.INTER_CUBIC)
+        original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
+        ax.imshow(original_img_resized)
+        ax.imshow(heatmap_resized, cmap='jet', alpha=0.6)
+        ax.axis('off')
+        ax.set_aspect('auto')
+        ax.margins(0)
+
+    # 绘制每一行（每个数据集）
+    base_output_file = output_file.replace('.png', '')
+
+    for row_idx, result in enumerate(all_results):
+        dataset_name = result['dataset_name']
+        images_data = result['images']  # 该数据集的多张图片
+        K = result['K']
+
+        col_idx = 0  # 当前列索引
+
+        # 遍历该数据集的每张图片
+        for img_idx, img_data in enumerate(images_data):
+            original_img = img_data['original_img']
+            part_maps = img_data['part_maps']
+
+            # 第0列：原图
+            if col_idx < num_cols:
+                ax_orig = axes[row_idx, col_idx]
+                original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
+                # 确保图片是RGB模式（防止灰度图）
+                if original_img_resized.mode != 'RGB':
+                    original_img_resized = original_img_resized.convert('RGB')
+                ax_orig.imshow(original_img_resized)
+                ax_orig.axis('off')
+                ax_orig.set_aspect('auto')
+                ax_orig.margins(0)
+                col_idx += 1
+
+                # 保存单独的原图（确保保存为RGB彩色图）
+                # 方法1：使用PIL直接保存（更可靠）
+                original_img_resized.save(f"{base_output_file}_{dataset_name}_img{img_idx+1}_original.png", 'PNG')
+                print(f"单独原图已保存: {base_output_file}_{dataset_name}_img{img_idx+1}_original.png")
+
+                # 方法2：也可以使用matplotlib保存（确保RGB模式）
+                # fig_single = plt.figure(figsize=(2.5, 2.5), facecolor='white')
+                # ax_single = plt.gca()
+                # # 确保图片是RGB模式
+                # if original_img_resized.mode != 'RGB':
+                #     original_img_resized = original_img_resized.convert('RGB')
+                # ax_single.imshow(original_img_resized)
+                # ax_single.axis('off')
+                # ax_single.set_aspect('auto')
+                # ax_single.margins(0)
+                # plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                # single_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_original.png"
+                # plt.savefig(single_output, dpi=300, bbox_inches='tight', pad_inches=0, facecolor='white')
+                # plt.close()
+
+            # 第1到K列：各个part
+            for k in range(K):
+                if col_idx < num_cols:
+                    ax_part = axes[row_idx, col_idx]
+                    heatmap = part_maps[:, :, k]
+                    draw_heatmap_simple(ax_part, original_img, heatmap)
+                    col_idx += 1
+
+                    # 保存单独的part图
+                    fig_single = plt.figure(figsize=(2.5, 2.5))
+                    ax_single = plt.gca()
+                    draw_heatmap_simple(ax_single, original_img, heatmap)
+                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                    single_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_part{k+1}.png"
+                    plt.savefig(single_output, dpi=300, bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                    print(f"单独part图已保存: {single_output}")
+
+        # 隐藏该行多余的列
+        for c in range(col_idx, num_cols):
+            axes[row_idx, c].axis('off')
+
+    plt.subplots_adjust(hspace=0.1, wspace=0.05, left=0, right=1, top=0.96, bottom=0)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\n对比可视化已保存至: {output_file}")
+
+# ==========================================
 # 4. 运行入口
 # ==========================================
 if __name__ == "__main__":
     # -------------------------------------------------
-    # 配置: 修改这里的路径匹配模式
+    # 配置: 多数据集对比可视化
     # -------------------------------------------------
-    # 例如: "dataset/birds/*.jpg" 或者简单的 "*.jpg"
-    img_path_pattern = "outputs/stanford_cars/*.jpg"
-    # img_path_pattern = "outputs/fgvc_aircraft/*.jpg"
-    # img_path_pattern = "outputs/oxford_pets_cat/*.jpg"
-    # img_path_pattern = "outputs/oxford_pets_dog/*.jpg"
-    # img_path_patterns = ["outputs/stanford_cars/*.jpg", "outputs/fgvc_aircraft/*.jpg", "outputs/oxford_pets/*.jpg", "outputs/oxford_pets_cat/*.jpg", "outputs/oxford_pets_dog/*.jpg"]
-    img_path_patterns = ["outputs/fgvc_aircraft/*.jpg"]
+    # 生成飞机/汽车/宠物的对比图，每个类别一行
+    # 可以为每个数据集设置不同的K值（4/6/8/10）
 
-    for img_path_pattern in img_path_patterns:
-        # 搜索图片
-        img_list = glob.glob(img_path_pattern)
+    # 配置数据集：飞机、汽车、宠物
+    # 基础配置（路径和图片数量）
+    base_configs = [
+        {
+            'path_pattern': 'outputs/fgvc_aircraft/*.jpg',
+            'name': 'aircraft',
+            'num_images': 6,  # 选择3张图片（随机选择）
+            # 'img_indices': [0, 1, 2]  # 或者指定具体的图片索引
+        },
+        {
+            'path_pattern': 'outputs/stanford_cars/*.jpg',
+            'name': 'cars',
+            'num_images': 3,  # 选择3张图片
+        },
+        {
+            'path_pattern': 'outputs/oxford_pets/*.jpg',  # 或者 oxford_pets_dog
+            'name': 'pets',
+            'num_images': 3,  # 选择3张图片
+        },
+        {
+            'path_pattern': 'outputs/oxford_pets_cat/*.jpg',  # 或者 oxford_pets_dog
+            'name': 'pets_cat',
+            'num_images': 3,  # 选择3张图片
+        },
+        {
+            'path_pattern': 'outputs/oxford_pets_dog/*.jpg',  # 或者 oxford_pets_dog
+            'name': 'pets_dog',
+            'num_images': 3,  # 选择3张图片
+        }
+    ]
 
-        if len(img_list) > 0:
-            print(f"找到 {len(img_list)} 张图片: {img_list[:3]} ...")
+    # 为每个数据集设置K值（可以分别为每个数据集设置不同的K值）
+    K_values = [3, 4, 5, 6, 8, 10, 12]  # 可以修改这里来生成不同K值的版本
 
-            # 从路径中提取数据集名称
-            dataset_name = None
-            if 'stanford_cars' in img_path_pattern.lower():
-                dataset_name = "stanford_cars"
-            elif 'birds' in img_path_pattern.lower() or 'cub' in img_path_pattern.lower():
-                dataset_name = "birds"
-            elif 'oxford_pets_cat' in img_path_pattern.lower():
-                dataset_name = "oxford_pets_cat"
-            elif 'oxford_pets_dog' in img_path_pattern.lower():
-                dataset_name = "oxford_pets_dog"
-            elif 'fgvc_aircraft' in img_path_pattern.lower():
-                dataset_name = "fgvc_aircraft"
-            elif 'dataset' in img_path_pattern:
-                # 尝试从路径中提取
-                path_parts = img_path_pattern.replace('\\', '/').split('/')
-                for i, part in enumerate(path_parts):
-                    if part in ['outputs', 'dataset', 'data'] and i + 1 < len(path_parts):
-                        dataset_name = path_parts[i + 1]
-                        break
+    # 生成多个K值的对比图
+    for K_value in K_values:
+        dataset_configs = []
+        for base_config in base_configs:
+            config = base_config.copy()
+            config['K'] = K_value
+            dataset_configs.append(config)
 
-            # CUB鸟类建议 K=5
-            # Stanford Cars 建议 K=6
-            # 其他通用物体 建议 K=4
-            run_partgcd_visualization(img_list, K=5, output_file=f"outputs/results/{dataset_name}_partgcd_reproduction.png", dataset_name=dataset_name)
-        else:
-            print(f"当前目录下未找到匹配 '{img_path_pattern}' 的图片，请修改代码底部的 img_path_pattern 变量。")
+        # 生成对比可视化（每个数据集一行，每行包含多张图片，每张图片包含原图+K个part）
+        # 同时会单独保存每个小图
+        print(f"\n{'='*80}")
+        print(f"生成 K={K_value} 的对比可视化")
+        print(f"{'='*80}")
+        run_multi_dataset_comparison(
+            dataset_configs,
+            output_file=f"outputs/results/multi_dataset_comparison_K{K_value}.png"
+        )
+
+    # 如果只想生成一个特定K值的版本，可以使用下面的代码（取消注释）
+    # dataset_configs = [
+    #     {
+    #         'path_pattern': 'outputs/fgvc_aircraft/*.jpg',
+    #         'name': 'aircraft',
+    #         'K': 6,  # 飞机使用K=6
+    #         'img_idx': 0
+    #     },
+    #     {
+    #         'path_pattern': 'outputs/stanford_cars/*.jpg',
+    #         'name': 'cars',
+    #         'K': 6,  # 汽车使用K=6
+    #         'img_idx': 0
+    #     },
+    #     {
+    #         'path_pattern': 'outputs/oxford_pets_cat/*.jpg',
+    #         'name': 'pets',
+    #         'K': 4,  # 宠物使用K=4
+    #         'img_idx': 0
+    #     }
+    # ]
+    # run_multi_dataset_comparison(
+    #     dataset_configs,
+    #     output_file="outputs/results/multi_dataset_comparison.png"
+    # )
+
+    # -------------------------------------------------
+    # 如果需要单独运行某个数据集，可以取消下面的注释
+    # -------------------------------------------------
+    # img_path_pattern = "outputs/stanford_cars/*.jpg"
+    # img_list = glob.glob(img_path_pattern)
+    # if len(img_list) > 0:
+    #     dataset_name = "stanford_cars"
+    #     run_partgcd_visualization(img_list, K=6,
+    #                              output_file=f"outputs/results/{dataset_name}_partgcd_reproduction.png",
+    #                              dataset_name=dataset_name)
