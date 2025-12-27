@@ -1579,33 +1579,8 @@ def run_multi_dataset_comparison(dataset_configs, output_file="outputs/results/m
         print("错误: 没有成功处理任何数据集")
         return
 
-    # 生成可视化
-    print(f"\n生成对比可视化...")
-    num_datasets = len(all_results)
-
-    # 计算每行需要的列数：每张图片需要 (1原图 + K个part) 列
-    # 找到每行最多需要多少列
-    max_cols_per_row = 0
-    for result in all_results:
-        num_imgs = len(result['images'])
-        K = result['K']
-        cols_per_row = num_imgs * (1 + K)  # 每张图片：1原图 + K个part
-        max_cols_per_row = max(max_cols_per_row, cols_per_row)
-
-    num_rows = num_datasets
-    num_cols = max_cols_per_row
-
-    # 创建主图
-    fig, axes = plt.subplots(num_rows, num_cols,
-                            figsize=(2.0 * num_cols, 2.5 * num_rows),
-                            gridspec_kw={'hspace': 0.1, 'wspace': 0.05,
-                                        'left': 0, 'right': 1, 'top': 0.96, 'bottom': 0})
-
-    # 确保axes是2D数组
-    if num_rows == 1:
-        axes = np.expand_dims(axes, axis=0)
-    if num_cols == 1:
-        axes = np.expand_dims(axes, axis=1)
+    # 生成可视化：为每张图片单独生成组图（1张原图+多个part）
+    print(f"\n生成单图片组图可视化...")
 
     # 辅助函数：绘制热力图
     def draw_heatmap_simple(ax, original_img, heatmap):
@@ -1620,80 +1595,68 @@ def run_multi_dataset_comparison(dataset_configs, output_file="outputs/results/m
         ax.set_aspect('auto')
         ax.margins(0)
 
-    # 绘制每一行（每个数据集）
     base_output_file = output_file.replace('.png', '')
 
-    for row_idx, result in enumerate(all_results):
+    # 为每个数据集的每张图片单独生成组图
+    for result in all_results:
         dataset_name = result['dataset_name']
         images_data = result['images']  # 该数据集的多张图片
         K = result['K']
-
-        col_idx = 0  # 当前列索引
 
         # 遍历该数据集的每张图片
         for img_idx, img_data in enumerate(images_data):
             original_img = img_data['original_img']
             part_maps = img_data['part_maps']
 
+            # 为这张图片创建单独的组图：1行，1张原图+K个part
+            num_cols = 1 + K  # 1张原图 + K个part
+            fig, axes = plt.subplots(1, num_cols,
+                                    figsize=(2.5 * num_cols, 2.5),
+                                    gridspec_kw={'hspace': 0, 'wspace': 0,
+                                                'left': 0, 'right': 1, 'top': 1, 'bottom': 0})
+
+            # 确保axes是1D数组
+            if num_cols == 1:
+                axes = [axes]
+            else:
+                axes = axes.flatten()
+
             # 第0列：原图
-            if col_idx < num_cols:
-                ax_orig = axes[row_idx, col_idx]
-                original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
-                # 确保图片是RGB模式（防止灰度图）
-                if original_img_resized.mode != 'RGB':
-                    original_img_resized = original_img_resized.convert('RGB')
-                ax_orig.imshow(original_img_resized)
-                ax_orig.axis('off')
-                ax_orig.set_aspect('auto')
-                ax_orig.margins(0)
-                col_idx += 1
-
-                # 保存单独的原图（确保保存为RGB彩色图）
-                # 方法1：使用PIL直接保存（更可靠）
-                original_img_resized.save(f"{base_output_file}_{dataset_name}_img{img_idx+1}_original.png", 'PNG')
-                print(f"单独原图已保存: {base_output_file}_{dataset_name}_img{img_idx+1}_original.png")
-
-                # 方法2：也可以使用matplotlib保存（确保RGB模式）
-                # fig_single = plt.figure(figsize=(2.5, 2.5), facecolor='white')
-                # ax_single = plt.gca()
-                # # 确保图片是RGB模式
-                # if original_img_resized.mode != 'RGB':
-                #     original_img_resized = original_img_resized.convert('RGB')
-                # ax_single.imshow(original_img_resized)
-                # ax_single.axis('off')
-                # ax_single.set_aspect('auto')
-                # ax_single.margins(0)
-                # plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                # single_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_original.png"
-                # plt.savefig(single_output, dpi=300, bbox_inches='tight', pad_inches=0, facecolor='white')
-                # plt.close()
+            original_img_resized = original_img.resize(TARGET_SIZE, Image.LANCZOS)
+            # 确保图片是RGB模式（防止灰度图）
+            if original_img_resized.mode != 'RGB':
+                original_img_resized = original_img_resized.convert('RGB')
+            axes[0].imshow(original_img_resized)
+            axes[0].axis('off')
+            axes[0].set_aspect('auto')
+            axes[0].margins(0)
 
             # 第1到K列：各个part
             for k in range(K):
-                if col_idx < num_cols:
-                    ax_part = axes[row_idx, col_idx]
-                    heatmap = part_maps[:, :, k]
-                    draw_heatmap_simple(ax_part, original_img, heatmap)
-                    col_idx += 1
+                heatmap = part_maps[:, :, k]
+                draw_heatmap_simple(axes[k + 1], original_img, heatmap)
 
-                    # 保存单独的part图
-                    fig_single = plt.figure(figsize=(2.5, 2.5))
-                    ax_single = plt.gca()
-                    draw_heatmap_simple(ax_single, original_img, heatmap)
-                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                    single_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_part{k+1}.png"
-                    plt.savefig(single_output, dpi=300, bbox_inches='tight', pad_inches=0)
-                    plt.close()
-                    print(f"单独part图已保存: {single_output}")
+            # 保存单图片组图
+            single_group_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_group.png"
+            plt.subplots_adjust(hspace=0, wspace=0, left=0, right=1, top=1, bottom=0)
+            plt.savefig(single_group_output, dpi=300, bbox_inches='tight', pad_inches=0)
+            plt.close()
+            print(f"单图片组图已保存: {single_group_output} (1张原图 + {K}个part)")
 
-        # 隐藏该行多余的列
-        for c in range(col_idx, num_cols):
-            axes[row_idx, c].axis('off')
+            # # 同时保存单独的原图和各个part图（可选，保持向后兼容）
+            # original_img_resized.save(f"{base_output_file}_{dataset_name}_img{img_idx+1}_original.png", 'PNG')
 
-    plt.subplots_adjust(hspace=0.1, wspace=0.05, left=0, right=1, top=0.96, bottom=0)
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"\n对比可视化已保存至: {output_file}")
+            # for k in range(K):
+            #     fig_single = plt.figure(figsize=(2.5, 2.5))
+            #     ax_single = plt.gca()
+            #     heatmap = part_maps[:, :, k]
+            #     draw_heatmap_simple(ax_single, original_img, heatmap)
+            #     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            #     single_output = f"{base_output_file}_{dataset_name}_img{img_idx+1}_part{k+1}.png"
+            #     plt.savefig(single_output, dpi=300, bbox_inches='tight', pad_inches=0)
+            #     plt.close()
+
+    print(f"\n所有单图片组图已生成完成")
 
 # ==========================================
 # 4. 运行入口
@@ -1711,13 +1674,13 @@ if __name__ == "__main__":
         {
             'path_pattern': 'outputs/fgvc_aircraft/*.jpg',
             'name': 'aircraft',
-            'num_images': 6,  # 选择3张图片（随机选择）
+            'num_images': 10,  # 选择3张图片（随机选择）
             # 'img_indices': [0, 1, 2]  # 或者指定具体的图片索引
         },
         {
             'path_pattern': 'outputs/stanford_cars/*.jpg',
             'name': 'cars',
-            'num_images': 3,  # 选择3张图片
+            'num_images': 10,  # 选择3张图片
         },
         {
             'path_pattern': 'outputs/oxford_pets/*.jpg',  # 或者 oxford_pets_dog
@@ -1727,12 +1690,12 @@ if __name__ == "__main__":
         {
             'path_pattern': 'outputs/oxford_pets_cat/*.jpg',  # 或者 oxford_pets_dog
             'name': 'pets_cat',
-            'num_images': 3,  # 选择3张图片
+            'num_images': 10,  # 选择3张图片
         },
         {
             'path_pattern': 'outputs/oxford_pets_dog/*.jpg',  # 或者 oxford_pets_dog
             'name': 'pets_dog',
-            'num_images': 3,  # 选择3张图片
+            'num_images': 10,  # 选择3张图片
         }
     ]
 
